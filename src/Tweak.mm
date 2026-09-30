@@ -30,8 +30,6 @@ static void NRLog(const char *fmt, ...) {
     fflush(g_log);
 }
 
-#pragma mark - Info gathering
-
 static void DumpEnvironment(void) {
     NRLog("--- env ---");
     NRLog("pid=%d", getpid());
@@ -109,7 +107,7 @@ static void DumpObjcClasses(void) {
     for (int i = 0; targets[i]; i++) {
         Class c = objc_getClass(targets[i]);
         if (!c) continue;
-        NRLog("class %s = %p", targets[i], (void *)c);
+        NRLog("class %s = %p", targets[i], (__bridge void *)c);
         unsigned int count = 0;
         Method *methods = class_copyMethodList(c, &count);
         if (methods) {
@@ -175,8 +173,6 @@ static void DumpRvaProbe(void) {
     }
 }
 
-#pragma mark - ObjC hook test
-
 typedef void (*MSHookMessageEx_t)(Class cls, SEL sel, IMP hook, IMP *old);
 static MSHookMessageEx_t MSHookMessageEx_p = NULL;
 
@@ -214,8 +210,6 @@ static void TestObjcHook(void) {
     NRLog("hooked sendAction, orig=%p", orig);
 }
 
-#pragma mark - Game image detection
-
 static BOOL DetectGame(void) {
     char execPath[PATH_MAX];
     uint32_t size = sizeof(execPath);
@@ -236,8 +230,6 @@ static BOOL DetectGame(void) {
     }
     return NO;
 }
-
-#pragma mark - UI
 
 @interface NRMenuVC : UIViewController
 @property (nonatomic, strong) UIStackView *stack;
@@ -327,8 +319,6 @@ static void ShowMenu(void) {
         [g_win addGestureRecognizer:pan];
     });
 }
-
-#pragma mark - Init
 
 __attribute__((constructor))
 static void nr_init(void) {
