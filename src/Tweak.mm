@@ -12,7 +12,6 @@
 
 typedef kern_return_t (*MSHookFunction_t)(void *symbol, void *hook, void **old);
 static MSHookFunction_t MSHookFunction_p = NULL;
-static void *g_hooklib = NULL;
 
 static uintptr_t g_base = 0;
 static char g_image[512] = {0};
@@ -33,8 +32,6 @@ static void NRLog(const char *fmt, ...) {
     fflush(g_log);
 }
 
-#pragma mark - Hooker loader
-
 static void *LoadHooker(void) {
     const char *paths[] = {
         "/var/jb/usr/lib/libellekit.dylib",
@@ -53,7 +50,6 @@ static void *LoadHooker(void) {
             void *f = dlsym(h, "MSHookFunction");
             if (f) {
                 NRLog("hooker loaded from %s f=%p", paths[i], f);
-                g_hooklib = h;
                 return f;
             }
             dlclose(h);
@@ -67,8 +63,6 @@ static void *LoadHooker(void) {
     NRLog("no hooker found");
     return NULL;
 }
-
-#pragma mark - Detect game image
 
 static BOOL DetectGame(void) {
     char execPath[PATH_MAX];
@@ -109,27 +103,36 @@ static inline void *GV(uint64_t rva) { return (void *)(g_base + rva); }
 
 #pragma mark - Hooks
 
-typedef void (*fn_recv_t)(void *self, void *msg, void *a, void *b, void *c, void *d);
-static fn_recv_t orig_recv = NULL;
-static BOOL g_recv_broken = NO;
+typedef void *(*fn_gbCtor_t)(void *self, void *clip);
+static fn_gbCtor_t orig_gbCtor = NULL;
+static int g_gbCount = 0;
 
-static void hook_recv(void *self, void *msg, void *a, void *b, void *c, void *d) {
-    static __thread int guard = 0;
-    if (!guard) {
-        guard = 1;
-        uint32_t msgId = 0;
-        if (msg) memcpy(&msgId, msg, 4);
-        NRLog("recv self=%p msg=%p id=0x%x", self, msg, msgId);
-        guard = 0;
-    }
-    if (orig_recv) {
-        orig_recv(self, msg, a, b, c, d);
-    } else {
-        if (!g_recv_broken) {
-            g_recv_broken = YES;
-            NRLog("orig_recv is NULL, cannot forward original call");
-        }
-    }
+static void *hook_gbCtor(void *self, void *clip) {
+    g_gbCount++;
+    NRLog("GameButton #%d self=%p clip=%p orig=%p", g_gbCount, self, clip, orig_gbCtor);
+    if (orig_gbCtor) return orig_gbCtor(self, clip);
+    return self;
+}
+
+typedef void *(*fn_charCtor_t)(void *self, void *a2, void *a3, void *a4);
+static fn_charCtor_t orig_charCtor = NULL;
+static int g_charCount = 0;
+
+static void *hook_charCtor(void *self, void *a2, void *a3, void *a4) {
+    g_charCount++;
+    NRLog("Character #%d self=%p orig=%p", g_charCount, self, orig_charCtor);
+    if (orig_charCtor) return orig_charCtor(self, a2, a3, a4);
+    return self;
+}
+
+typedef void (*fn_setVP_t)(void *self, void *a2, void *a3, void *a4);
+static fn_setVP_t orig_setVP = NULL;
+static int g_vpCount = 0;
+
+static void hook_setVP(void *self, void *a2, void *a3, void *a4) {
+    g_vpCount++;
+    if (g_vpCount < 10) NRLog("setViewport #%d self=%p orig=%p", g_vpCount, self, orig_setVP);
+    if (orig_setVP) orig_setVP(self, a2, a3, a4);
 }
 
 #pragma mark - UI
@@ -157,7 +160,7 @@ static void hook_recv(void *self, void *msg, void *a, void *b, void *c, void *d)
     [self.scroll addSubview:self.stack];
 
     UILabel *t = [UILabel new];
-    t.text = @"NullRythm";
+    t.text = @"NullRythm Test";
     t.textColor = [UIColor systemYellowColor];
     t.font = [UIFont boldSystemFontOfSize:17];
     [self.stack addArrangedSubview:t];
@@ -182,10 +185,22 @@ static void hook_recv(void *self, void *msg, void *a, void *b, void *c, void *d)
     [self.stack addArrangedSubview:i3];
 
     UILabel *i4 = [UILabel new];
-    i4.text = [NSString stringWithFormat:@"orig_recv: %p", orig_recv];
+    i4.text = [NSString stringWithFormat:@"gb orig: %p", orig_gbCtor];
     i4.textColor = [UIColor whiteColor];
     i4.font = [UIFont monospacedSystemFontOfSize:10 weight:UIFontWeightRegular];
     [self.stack addArrangedSubview:i4];
+
+    UILabel *i5 = [UILabel new];
+    i5.text = [NSString stringWithFormat:@"char orig: %p", orig_charCtor];
+    i5.textColor = [UIColor whiteColor];
+    i5.font = [UIFont monospacedSystemFontOfSize:10 weight:UIFontWeightRegular];
+    [self.stack addArrangedSubview:i5];
+
+    UILabel *i6 = [UILabel new];
+    i6.text = [NSString stringWithFormat:@"vp orig: %p", orig_setVP];
+    i6.textColor = [UIColor whiteColor];
+    i6.font = [UIFont monospacedSystemFontOfSize:10 weight:UIFontWeightRegular];
+    [self.stack addArrangedSubview:i6];
 
     dispatch_async(dispatch_get_main_queue(), ^{
         [self.stack layoutIfNeeded];
@@ -221,7 +236,7 @@ static void ShowMenu(void) {
             g_win.windowLevel = UIWindowLevelAlert + 100;
             g_win.backgroundColor = [UIColor clearColor];
             g_win.rootViewController = [NRMenuVC new];
-            g_win.frame = CGRectMake(70, 120, 290, 260);
+            g_win.frame = CGRectMake(70, 120, 290, 300);
             g_win.hidden = NO;
             UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:g_win action:@selector(nr_drag:)];
             [g_win addGestureRecognizer:pan];
@@ -260,9 +275,9 @@ static void InstallHooks(void) {
     NRLog("MSHookFunction = %p", MSHookFunction_p);
     fflush(g_log);
 
-    InstallOne("MessageManager::receiveMessage",
-               RVA_MESSAGEMANAGER_RECEIVEMESSAGE,
-               (void *)hook_recv, (void **)&orig_recv);
+    InstallOne("GameButton::ctor", RVA_GAMEBUTTON_CTOR, (void *)hook_gbCtor, (void **)&orig_gbCtor);
+    InstallOne("Character::ctor", RVA_CHARACTER_CTOR, (void *)hook_charCtor, (void **)&orig_charCtor);
+    InstallOne("Stage::setViewport", RVA_STAGE_SETVIEWPORT, (void *)hook_setVP, (void **)&orig_setVP);
 
     NRLog("=== InstallHooks done ===");
     fflush(g_log);
