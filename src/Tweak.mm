@@ -31,8 +31,6 @@ static void NRLog(const char *fmt, ...) {
     fflush(g_log);
 }
 
-#pragma mark - Detect game image
-
 static BOOL DetectGame(void) {
     char execPath[PATH_MAX];
     uint32_t size = sizeof(execPath);
@@ -272,44 +270,57 @@ static UIWindow *g_win = nil;
 
 static void ShowMenu(void) {
     dispatch_async(dispatch_get_main_queue(), ^{
-        UIWindowScene *scene = nil;
-        for (UIScene *s in UIApplication.sharedApplication.connectedScenes) {
-            if ([s isKindOfClass:UIWindowScene.class]) { scene = (UIWindowScene *)s; break; }
+        @try {
+            UIWindowScene *scene = nil;
+            for (UIScene *s in UIApplication.sharedApplication.connectedScenes) {
+                if ([s isKindOfClass:UIWindowScene.class]) { scene = (UIWindowScene *)s; break; }
+            }
+            if (!scene) { NRLog("ShowMenu: no scene"); return; }
+            g_win = [[UIWindow alloc] initWithWindowScene:scene];
+            g_win.windowLevel = UIWindowLevelAlert + 100;
+            g_win.backgroundColor = [UIColor clearColor];
+            g_win.rootViewController = [NRMenuVC new];
+            g_win.frame = CGRectMake(70, 120, 290, 220);
+            g_win.hidden = NO;
+            UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:g_win action:@selector(nr_drag:)];
+            [g_win addGestureRecognizer:pan];
+            NRLog("ShowMenu: ok");
+        } @catch (NSException *e) {
+            NRLog("ShowMenu exception: %s", e.reason.UTF8String);
         }
-        if (!scene) return;
-        g_win = [[UIWindow alloc] initWithWindowScene:scene];
-        g_win.windowLevel = UIWindowLevelAlert + 100;
-        g_win.backgroundColor = [UIColor clearColor];
-        g_win.rootViewController = [NRMenuVC new];
-        g_win.frame = CGRectMake(70, 120, 290, 220);
-        g_win.hidden = NO;
-        UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:g_win action:@selector(nr_drag:)];
-        [g_win addGestureRecognizer:pan];
     });
 }
 
 #pragma mark - Install
 
+static void InstallOne(const char *name, uint64_t rva, void *hook, void **orig) {
+    if (!MSHookFunction_p) {
+        NRLog("skip %s: MSHookFunction missing", name);
+        return;
+    }
+    void *addr = (void *)(g_base + rva);
+    NRLog("installing %s rva=0x%llx addr=%p", name, rva, addr);
+    fflush(g_log);
+    MSHookFunction_p(addr, hook, orig);
+    NRLog("  -> ok %s orig=%p", name, orig ? *orig : NULL);
+    fflush(g_log);
+}
+
 static void InstallHooks(void) {
+    NRLog("=== InstallHooks begin ===");
+    fflush(g_log);
+
     MSHookFunction_p = (MSHookFunction_t)dlsym(RTLD_DEFAULT, "MSHookFunction");
     if (!MSHookFunction_p) { NRLog("MSHookFunction missing"); return; }
+    NRLog("MSHookFunction = %p", MSHookFunction_p);
+    fflush(g_log);
 
-    MSHookFunction_p(GV(RVA_MESSAGEMANAGER_RECEIVEMESSAGE), (void *)hook_recv, (void **)&orig_recv);
-    MSHookFunction_p(GV(RVA_MESSAGEMANAGER_CTOR),          (void *)hook_mmCtor, (void **)&orig_mmCtor);
-    MSHookFunction_p(GV(RVA_GAMEBUTTON_CTOR),              (void *)hook_gbCtor, (void **)&orig_gbCtor);
-    MSHookFunction_p(GV(RVA_HOMEPAGE_CTOR),                (void *)hook_homeCtor, (void **)&orig_homeCtor);
-    MSHookFunction_p(GV(RVA_CHARACTER_CTOR),               (void *)hook_charCtor, (void **)&orig_charCtor);
-    MSHookFunction_p(GV(RVA_MOVIECLIP_CTOR),               (void *)hook_mcCtor, (void **)&orig_mcCtor);
-    MSHookFunction_p(GV(RVA_NATIVEFONT_CTOR),              (void *)hook_fontCtor, (void **)&orig_fontCtor);
-    MSHookFunction_p(GV(RVA_NATIVEFONT_FORMATSTRING),      (void *)hook_fmt, (void **)&orig_fmt);
-    MSHookFunction_p(GV(RVA_STAGE_CTOR),                   (void *)hook_stageCtor, (void **)&orig_stageCtor);
-    MSHookFunction_p(GV(RVA_STAGE_SETVIEWPORT),            (void *)hook_setVP, (void **)&orig_setVP);
-    MSHookFunction_p(GV(RVA_LOGICDATATABLES_CTOR),         (void *)hook_ldtCtor, (void **)&orig_ldtCtor);
-    MSHookFunction_p(GV(RVA_LOGICDATATABLES_INITDATATABLE),(void *)hook_ldtInit, (void **)&orig_ldtInit);
-    MSHookFunction_p(GV(RVA_LOGICPROJECTILEDATA_CTOR),     (void *)hook_projCtor, (void **)&orig_projCtor);
-    MSHookFunction_p(GV(RVA_LOGICPROJECTILEDATA_GETINTVALUE),(void *)hook_projGetInt, (void **)&orig_projGetInt);
+    InstallOne("MessageManager::receiveMessage",
+               RVA_MESSAGEMANAGER_RECEIVEMESSAGE,
+               (void *)hook_recv, (void **)&orig_recv);
 
-    NRLog("all hooks installed");
+    NRLog("=== InstallHooks done ===");
+    fflush(g_log);
 }
 
 static void TryInstall(void);
@@ -326,8 +337,11 @@ static void TryInstall(void) {
         return;
     }
     InstallHooks();
+    NRLog("calling ShowMenu");
+    fflush(g_log);
     ShowMenu();
     NRLog("=== done ===");
+    fflush(g_log);
 }
 
 __attribute__((constructor))
