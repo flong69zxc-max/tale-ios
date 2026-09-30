@@ -6,14 +6,14 @@
 #import <mach-o/loader.h>
 #import <libgen.h>
 #import <string.h>
-#include "offsets.h"
+#import <stdarg.h>
+#import "offsets.h"
 
 typedef void (*MSHookFunction_t)(void *symbol, void *hook, void **old);
 static MSHookFunction_t MSHookFunction_p = NULL;
 
 static uintptr_t g_base = 0;
 static char g_image[256] = {0};
-
 static FILE *g_log = NULL;
 
 static void NRLog(const char *fmt, ...) {
@@ -31,28 +31,44 @@ static void NRLog(const char *fmt, ...) {
     fflush(g_log);
 }
 
+#pragma mark - Detect game image
+
 static BOOL DetectGame(void) {
+    char execPath[PATH_MAX];
+    uint32_t size = sizeof(execPath);
+    if (_NSGetExecutablePath(execPath, &size) == 0) {
+        NRLog("exec path: %s", execPath);
+    }
+
     for (uint32_t i = 0; i < _dyld_image_count(); i++) {
         const char *path = _dyld_get_image_name(i);
         if (!path) continue;
-        if (strstr(path, "/Frameworks/") || strstr(path, "/System/") ||
-            strstr(path, "/usr/") || strstr(path, "/private/preboot/") ||
-            strstr(path, "LiveContainer") || strstr(path, "SideStore") ||
-            strstr(path, "/Tweaks/")) continue;
-        const struct mach_header_64 *hdr = (const struct mach_header_64 *)_dyld_get_image_header(i);
+
+        if (strstr(path, "/System/") || strstr(path, "/usr/") ||
+            strstr(path, "/private/preboot/") ||
+            strstr(path, "LiveContainer") || strstr(path, "SideStore")) continue;
+
+        const struct mach_header_64 *hdr =
+            (const struct mach_header_64 *)_dyld_get_image_header(i);
         if (!hdr || hdr->magic != MH_MAGIC_64) continue;
         if (hdr->filetype != MH_EXECUTE) continue;
+
+        if (strstr(path, ".app/") == NULL &&
+            strstr(path, ".app") == NULL) continue;
+
         g_base = (uintptr_t)hdr;
         strncpy(g_image, basename((char *)path), sizeof(g_image) - 1);
-        NRLog("image=%s base=%p", g_image, (void*)g_base);
+        NRLog(">>> game: %s base=%p", g_image, (void *)g_base);
         return YES;
     }
+
+    NRLog("game not found after scan");
     return NO;
 }
 
 static inline void *GV(uint64_t rva) { return (void *)(g_base + rva); }
 
-#pragma mark - ReceiveMessage
+#pragma mark - Hooks
 
 typedef void (*fn_recv_t)(void *self, void *msg, void *a, void *b, void *c, void *d);
 static fn_recv_t orig_recv = NULL;
@@ -69,8 +85,6 @@ static void hook_recv(void *self, void *msg, void *a, void *b, void *c, void *d)
     if (orig_recv) orig_recv(self, msg, a, b, c, d);
 }
 
-#pragma mark - GameButton ctor
-
 typedef void *(*fn_gbCtor_t)(void *self, void *clip);
 static fn_gbCtor_t orig_gbCtor = NULL;
 
@@ -79,8 +93,6 @@ static void *hook_gbCtor(void *self, void *clip) {
     NRLog("GameButton self=%p clip=%p", self, clip);
     return r;
 }
-
-#pragma mark - Character ctor
 
 typedef void *(*fn_charCtor_t)(void *self, void *a2, void *a3, void *a4);
 static fn_charCtor_t orig_charCtor = NULL;
@@ -91,8 +103,6 @@ static void *hook_charCtor(void *self, void *a2, void *a3, void *a4) {
     return r;
 }
 
-#pragma mark - HomePage ctor
-
 typedef void *(*fn_homeCtor_t)(void *self, void *a2);
 static fn_homeCtor_t orig_homeCtor = NULL;
 
@@ -101,8 +111,6 @@ static void *hook_homeCtor(void *self, void *a2) {
     NRLog("HomePage self=%p", self);
     return r;
 }
-
-#pragma mark - MovieClip ctor
 
 typedef void *(*fn_mcCtor_t)(void *self, void *a2);
 static fn_mcCtor_t orig_mcCtor = NULL;
@@ -113,8 +121,6 @@ static void *hook_mcCtor(void *self, void *a2) {
     return r;
 }
 
-#pragma mark - NativeFont ctor
-
 typedef void *(*fn_fontCtor_t)(void *self, void *a2);
 static fn_fontCtor_t orig_fontCtor = NULL;
 
@@ -123,8 +129,6 @@ static void *hook_fontCtor(void *self, void *a2) {
     NRLog("NativeFont self=%p", self);
     return r;
 }
-
-#pragma mark - Stage ctor
 
 typedef void *(*fn_stageCtor_t)(void *self, void *a2);
 static fn_stageCtor_t orig_stageCtor = NULL;
@@ -135,8 +139,6 @@ static void *hook_stageCtor(void *self, void *a2) {
     return r;
 }
 
-#pragma mark - Stage::setViewport
-
 typedef void (*fn_setVP_t)(void *self, void *a2, void *a3, void *a4);
 static fn_setVP_t orig_setVP = NULL;
 
@@ -145,8 +147,6 @@ static void hook_setVP(void *self, void *a2, void *a3, void *a4) {
     if (!once) { once = YES; NRLog("Stage::setViewport self=%p", self); }
     if (orig_setVP) orig_setVP(self, a2, a3, a4);
 }
-
-#pragma mark - LogicDataTables ctor
 
 typedef void *(*fn_ldtCtor_t)(void *self, void *a2);
 static fn_ldtCtor_t orig_ldtCtor = NULL;
@@ -157,8 +157,6 @@ static void *hook_ldtCtor(void *self, void *a2) {
     return r;
 }
 
-#pragma mark - LogicDataTables::initDataTable
-
 typedef void (*fn_ldtInit_t)(void *self, int idx, void *a3);
 static fn_ldtInit_t orig_ldtInit = NULL;
 
@@ -166,8 +164,6 @@ static void hook_ldtInit(void *self, int idx, void *a3) {
     NRLog("initDataTable self=%p idx=%d", self, idx);
     if (orig_ldtInit) orig_ldtInit(self, idx, a3);
 }
-
-#pragma mark - LogicProjectileData ctor
 
 typedef void *(*fn_projCtor_t)(void *self, void *a2);
 static fn_projCtor_t orig_projCtor = NULL;
@@ -177,8 +173,6 @@ static void *hook_projCtor(void *self, void *a2) {
     NRLog("LogicProjectileData self=%p", self);
     return r;
 }
-
-#pragma mark - LogicProjectileData::getIntValueFromColumn
 
 typedef int (*fn_projGetInt_t)(void *self, int col, int def);
 static fn_projGetInt_t orig_projGetInt = NULL;
@@ -190,8 +184,6 @@ static int hook_projGetInt(void *self, int col, int def) {
     return v;
 }
 
-#pragma mark - MessageManager ctor
-
 typedef void *(*fn_mmCtor_t)(void *self, void *a2);
 static fn_mmCtor_t orig_mmCtor = NULL;
 
@@ -200,8 +192,6 @@ static void *hook_mmCtor(void *self, void *a2) {
     NRLog("MessageManager self=%p", self);
     return r;
 }
-
-#pragma mark - NativeFont::formatString
 
 typedef void *(*fn_fmt_t)(void *self, void *out, void *fmt);
 static fn_fmt_t orig_fmt = NULL;
@@ -320,14 +310,27 @@ static void InstallHooks(void) {
     NRLog("all hooks installed");
 }
 
+static void TryInstall(void);
+
+static void ScheduleRetry(void) {
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{ TryInstall(); });
+}
+
+static void TryInstall(void) {
+    if (!DetectGame()) {
+        NRLog("retry...");
+        ScheduleRetry();
+        return;
+    }
+    InstallHooks();
+    ShowMenu();
+    NRLog("=== done ===");
+}
+
 __attribute__((constructor))
 static void nr_init(void) {
     NRLog("=== NullRythm init ===");
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{
-        if (!DetectGame()) { NRLog("game not found"); return; }
-        InstallHooks();
-        ShowMenu();
-        NRLog("=== done ===");
-    });
+                   dispatch_get_main_queue(), ^{ TryInstall(); });
 }
