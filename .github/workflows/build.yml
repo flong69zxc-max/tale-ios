@@ -16,11 +16,9 @@ jobs:
     timeout-minutes: 30
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
       - name: Install Theos
-        shell: bash
         run: |
           set -euo pipefail
           brew install ldid make || true
@@ -30,14 +28,12 @@ jobs:
           echo "/opt/homebrew/opt/make/libexec/gnubin" >> "$GITHUB_PATH"
 
       - name: Build
-        shell: bash
         run: |
           set -euo pipefail
           export PATH="/opt/homebrew/opt/make/libexec/gnubin:$PATH"
           gmake -j"$(sysctl -n hw.ncpu)" ARCHS=arm64 CC=clang CXX=clang++
 
       - name: Package
-        shell: bash
         run: |
           set -euo pipefail
           mkdir -p out
