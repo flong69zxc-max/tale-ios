@@ -1,333 +1,173 @@
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
-#import <objc/runtime.h>
 #import <dlfcn.h>
 #import <mach-o/dyld.h>
 #import <mach-o/loader.h>
+#import <mach/mach.h>
+#import <mach/vm_map.h>
 #import <libgen.h>
 #import <string.h>
-#include "offsets.h"
+#import <stdio.h>
+#import <stdarg.h>
+
+#import "offsets.h"
 
 typedef void (*MSHookFunction_t)(void *symbol, void *hook, void **old);
-static MSHookFunction_t MSHookFunction_p = NULL;
+static MSHookFunction_t MSHookFunction_p = nullptr;
 
-static uintptr_t g_base = 0;
-static char g_image[256] = {0};
+typedef kern_return_t (*vm_protect_t)(vm_map_t, vm_address_t, vm_size_t, boolean_t, vm_prot_t);
+static vm_protect_t builtin_vm_protect_p = nullptr;
 
-static FILE *g_log = NULL;
+typedef void (*recv_t)(void*, void*, void*, void*, void*, void*);
+static recv_t orig_recv = NULL;
 
-static void NRLog(const char *fmt, ...) {
-    if (!g_log) {
-        NSString *dir = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents"];
-        [[NSFileManager defaultManager] createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
-        NSString *p = [dir stringByAppendingPathComponent:@"NullRythm.log"];
-        g_log = fopen(p.UTF8String, "a");
-    }
-    if (!g_log) return;
-    va_list ap; va_start(ap, fmt);
-    vfprintf(g_log, fmt, ap);
-    fputc('\n', g_log);
-    va_end(ap);
-    fflush(g_log);
+static int g_recv_count = 0;
+static FILE *g_logf = NULL;
+
+extern "C" void OXLogC(const char *tag, uint64_t a, uint64_t b) {
+    NSLog(@"[C] %s a=0x%llx b=0x%llx", tag, a, b);
 }
 
-static BOOL DetectGame(void) {
+static void TaleLogOpen(void) {
+    if (g_logf) return;
+    NSString *dir = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents"];
+    [[NSFileManager defaultManager] createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
+    NSString *path = [dir stringByAppendingPathComponent:@"talemod.log"];
+    g_logf = fopen(path.UTF8String, "w");
+}
+
+static void TaleLog(const char *fmt, ...) {
+    if (!g_logf) TaleLogOpen();
+    if (!g_logf) return;
+    va_list ap; va_start(ap, fmt); vfprintf(g_logf, fmt, ap); fputc('\n', g_logf); va_end(ap); fflush(g_logf);
+}
+
+static NSString *DetectGameImage(void) {
     for (uint32_t i = 0; i < _dyld_image_count(); i++) {
-        const char *path = _dyld_get_image_name(i);
-        if (!path) continue;
-        if (strstr(path, "/Frameworks/") || strstr(path, "/System/") ||
-            strstr(path, "/usr/") || strstr(path, "/private/preboot/") ||
-            strstr(path, "LiveContainer") || strstr(path, "SideStore") ||
-            strstr(path, "/Tweaks/")) continue;
+        const char *n = _dyld_get_image_name(i);
+        if (n && strstr(n, "/NB.app/") && !strstr(n, "/Frameworks/"))
+            return [NSString stringWithUTF8String:basename((char *)n)];
+    }
+    for (uint32_t i = 0; i < _dyld_image_count(); i++) {
+        const char *n = _dyld_get_image_name(i);
+        if (!n) continue;
+        if (strstr(n, "LiveContainer") || strstr(n, "SideStore") ||
+            strstr(n, "/Frameworks/") || strstr(n, "/System/") ||
+            strstr(n, "/usr/") || strstr(n, "/private/preboot/") ||
+            strstr(n, "/Tweaks/")) continue;
         const struct mach_header_64 *hdr = (const struct mach_header_64 *)_dyld_get_image_header(i);
-        if (!hdr || hdr->magic != MH_MAGIC_64) continue;
-        if (hdr->filetype != MH_EXECUTE) continue;
-        g_base = (uintptr_t)hdr;
-        strncpy(g_image, basename((char *)path), sizeof(g_image) - 1);
-        NRLog("image=%s base=%p", g_image, (void*)g_base);
-        return YES;
+        if (!hdr || (hdr->magic != MH_MAGIC_64 && hdr->magic != MH_CIGAM_64) ||
+            hdr->filetype != MH_EXECUTE) continue;
+        return [NSString stringWithUTF8String:basename((char *)n)];
+    }
+    return nil;
+}
+
+static uint64_t Resolve(NSString *imageName, uint64_t rva) {
+    if (!imageName) return 0;
+    const char *target = imageName.UTF8String;
+    for (uint32_t i = 0; i < _dyld_image_count(); i++) {
+        const char *n = _dyld_get_image_name(i);
+        if (!n || strcmp(basename((char *)n), target) != 0) continue;
+        const struct mach_header_64 *hdr = (const struct mach_header_64 *)_dyld_get_image_header(i);
+        if (!hdr || (hdr->magic != MH_MAGIC_64 && hdr->magic != MH_CIGAM_64)) continue;
+        return (uint64_t)hdr + rva;
+    }
+    return 0;
+}
+
+static BOOL CheckJIT(uint64_t addr, int retries) {
+    for (int a = 0; a < retries; a++) {
+        vm_address_t region = (vm_address_t)addr;
+        vm_size_t size = 0;
+        vm_region_basic_info_data_64_t info;
+        mach_msg_type_number_t cnt = VM_REGION_BASIC_INFO_COUNT_64;
+        mach_port_t obj = MACH_PORT_NULL;
+        kern_return_t kr = vm_region_64(mach_task_self(), &region, &size,
+                                        VM_REGION_BASIC_INFO_64,
+                                        (vm_region_info_t)&info, &cnt, &obj);
+        if (kr != KERN_SUCCESS) { sleep(2); continue; }
+
+        if (!builtin_vm_protect_p)
+            builtin_vm_protect_p = (vm_protect_t)dlsym(RTLD_DEFAULT, "builtin_vm_protect");
+
+        kern_return_t krw;
+        if (builtin_vm_protect_p)
+            krw = builtin_vm_protect_p(mach_task_self(), (vm_address_t)addr, 4, TRUE,
+                                        VM_PROT_READ | VM_PROT_WRITE);
+        else
+            krw = vm_protect(mach_task_self(), (vm_address_t)addr, 4, TRUE,
+                             VM_PROT_READ | VM_PROT_WRITE);
+
+        region = (vm_address_t)addr; size = 0; cnt = VM_REGION_BASIC_INFO_COUNT_64; obj = MACH_PORT_NULL;
+        kr = vm_region_64(mach_task_self(), &region, &size,
+                          VM_REGION_BASIC_INFO_64,
+                          (vm_region_info_t)&info, &cnt, &obj);
+        vm_prot_t after = (kr == KERN_SUCCESS) ? info.protection : 0;
+
+        if (builtin_vm_protect_p)
+            builtin_vm_protect_p(mach_task_self(), (vm_address_t)addr, 4, TRUE,
+                                  VM_PROT_READ | VM_PROT_EXECUTE);
+        else
+            vm_protect(mach_task_self(), (vm_address_t)addr, 4, TRUE,
+                       VM_PROT_READ | VM_PROT_EXECUTE);
+
+        TaleLog("[TaleMod] JIT attempt %d: kr=0x%x prot=%c%c%c",
+                a + 1, krw,
+                (after & VM_PROT_READ) ? 'r' : '-',
+                (after & VM_PROT_WRITE) ? 'w' : '-',
+                (after & VM_PROT_EXECUTE) ? 'x' : '-');
+
+        if (after & VM_PROT_WRITE) return YES;
+        if (a < retries - 1) sleep(2);
     }
     return NO;
 }
 
-static inline void *GV(uint64_t rva) { return (void *)(g_base + rva); }
-
-#pragma mark - ReceiveMessage
-
-typedef void (*fn_recv_t)(void *self, void *msg, void *a, void *b, void *c, void *d);
-static fn_recv_t orig_recv = NULL;
-
-static void hook_recv(void *self, void *msg, void *a, void *b, void *c, void *d) {
+static void my_recv(void *a, void *b, void *c, void *d, void *e, void *f) {
     static __thread int guard = 0;
-    if (!guard) {
-        guard = 1;
-        uint32_t msgId = 0;
-        if (msg) memcpy(&msgId, msg, 4);
-        NRLog("recv self=%p msg=%p id=0x%x", self, msg, msgId);
-        guard = 0;
+    if (guard) { if (orig_recv) orig_recv(a,b,c,d,e,f); return; }
+    guard = 1;
+    if (g_recv_count < 50) {
+        g_recv_count++;
+        TaleLog("[TaleMod] recv #%d self=%p msg=%p", g_recv_count, a, b);
     }
-    if (orig_recv) orig_recv(self, msg, a, b, c, d);
+    if (orig_recv) orig_recv(a,b,c,d,e,f);
+    guard = 0;
 }
-
-#pragma mark - GameButton ctor
-
-typedef void *(*fn_gbCtor_t)(void *self, void *clip);
-static fn_gbCtor_t orig_gbCtor = NULL;
-
-static void *hook_gbCtor(void *self, void *clip) {
-    void *r = orig_gbCtor ? orig_gbCtor(self, clip) : self;
-    NRLog("GameButton self=%p clip=%p", self, clip);
-    return r;
-}
-
-#pragma mark - Character ctor
-
-typedef void *(*fn_charCtor_t)(void *self, void *a2, void *a3, void *a4);
-static fn_charCtor_t orig_charCtor = NULL;
-
-static void *hook_charCtor(void *self, void *a2, void *a3, void *a4) {
-    void *r = orig_charCtor ? orig_charCtor(self, a2, a3, a4) : self;
-    NRLog("Character self=%p", self);
-    return r;
-}
-
-#pragma mark - HomePage ctor
-
-typedef void *(*fn_homeCtor_t)(void *self, void *a2);
-static fn_homeCtor_t orig_homeCtor = NULL;
-
-static void *hook_homeCtor(void *self, void *a2) {
-    void *r = orig_homeCtor ? orig_homeCtor(self, a2) : self;
-    NRLog("HomePage self=%p", self);
-    return r;
-}
-
-#pragma mark - MovieClip ctor
-
-typedef void *(*fn_mcCtor_t)(void *self, void *a2);
-static fn_mcCtor_t orig_mcCtor = NULL;
-
-static void *hook_mcCtor(void *self, void *a2) {
-    void *r = orig_mcCtor ? orig_mcCtor(self, a2) : self;
-    NRLog("MovieClip self=%p", self);
-    return r;
-}
-
-#pragma mark - NativeFont ctor
-
-typedef void *(*fn_fontCtor_t)(void *self, void *a2);
-static fn_fontCtor_t orig_fontCtor = NULL;
-
-static void *hook_fontCtor(void *self, void *a2) {
-    void *r = orig_fontCtor ? orig_fontCtor(self, a2) : self;
-    NRLog("NativeFont self=%p", self);
-    return r;
-}
-
-#pragma mark - Stage ctor
-
-typedef void *(*fn_stageCtor_t)(void *self, void *a2);
-static fn_stageCtor_t orig_stageCtor = NULL;
-
-static void *hook_stageCtor(void *self, void *a2) {
-    void *r = orig_stageCtor ? orig_stageCtor(self, a2) : self;
-    NRLog("Stage self=%p", self);
-    return r;
-}
-
-#pragma mark - Stage::setViewport
-
-typedef void (*fn_setVP_t)(void *self, void *a2, void *a3, void *a4);
-static fn_setVP_t orig_setVP = NULL;
-
-static void hook_setVP(void *self, void *a2, void *a3, void *a4) {
-    static BOOL once = NO;
-    if (!once) { once = YES; NRLog("Stage::setViewport self=%p", self); }
-    if (orig_setVP) orig_setVP(self, a2, a3, a4);
-}
-
-#pragma mark - LogicDataTables ctor
-
-typedef void *(*fn_ldtCtor_t)(void *self, void *a2);
-static fn_ldtCtor_t orig_ldtCtor = NULL;
-
-static void *hook_ldtCtor(void *self, void *a2) {
-    void *r = orig_ldtCtor ? orig_ldtCtor(self, a2) : self;
-    NRLog("LogicDataTables self=%p", self);
-    return r;
-}
-
-#pragma mark - LogicDataTables::initDataTable
-
-typedef void (*fn_ldtInit_t)(void *self, int idx, void *a3);
-static fn_ldtInit_t orig_ldtInit = NULL;
-
-static void hook_ldtInit(void *self, int idx, void *a3) {
-    NRLog("initDataTable self=%p idx=%d", self, idx);
-    if (orig_ldtInit) orig_ldtInit(self, idx, a3);
-}
-
-#pragma mark - LogicProjectileData ctor
-
-typedef void *(*fn_projCtor_t)(void *self, void *a2);
-static fn_projCtor_t orig_projCtor = NULL;
-
-static void *hook_projCtor(void *self, void *a2) {
-    void *r = orig_projCtor ? orig_projCtor(self, a2) : self;
-    NRLog("LogicProjectileData self=%p", self);
-    return r;
-}
-
-#pragma mark - LogicProjectileData::getIntValueFromColumn
-
-typedef int (*fn_projGetInt_t)(void *self, int col, int def);
-static fn_projGetInt_t orig_projGetInt = NULL;
-
-static int hook_projGetInt(void *self, int col, int def) {
-    int v = orig_projGetInt ? orig_projGetInt(self, col, def) : def;
-    static int logged = 0;
-    if (logged < 200) { logged++; NRLog("projGetInt self=%p col=%d -> %d", self, col, v); }
-    return v;
-}
-
-#pragma mark - MessageManager ctor
-
-typedef void *(*fn_mmCtor_t)(void *self, void *a2);
-static fn_mmCtor_t orig_mmCtor = NULL;
-
-static void *hook_mmCtor(void *self, void *a2) {
-    void *r = orig_mmCtor ? orig_mmCtor(self, a2) : self;
-    NRLog("MessageManager self=%p", self);
-    return r;
-}
-
-#pragma mark - NativeFont::formatString
-
-typedef void *(*fn_fmt_t)(void *self, void *out, void *fmt);
-static fn_fmt_t orig_fmt = NULL;
-
-static void *hook_fmt(void *self, void *out, void *fmt) {
-    static int logged = 0;
-    if (logged < 50) { logged++; NRLog("formatString self=%p out=%p fmt=%p", self, out, fmt); }
-    if (orig_fmt) return orig_fmt(self, out, fmt);
-    return out;
-}
-
-#pragma mark - UI
-
-@interface NRMenuVC : UIViewController
-@property (nonatomic, strong) UIStackView *stack;
-@property (nonatomic, strong) UIScrollView *scroll;
-@end
-
-@implementation NRMenuVC
-
-- (void)viewDidLoad {
-    [super viewDidLoad];
-    self.view.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.8];
-    self.view.layer.cornerRadius = 12;
-    self.view.clipsToBounds = YES;
-
-    self.scroll = [[UIScrollView alloc] initWithFrame:self.view.bounds];
-    self.scroll.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
-    [self.view addSubview:self.scroll];
-
-    self.stack = [[UIStackView alloc] initWithFrame:CGRectMake(12, 12, 260, 100)];
-    self.stack.axis = UILayoutConstraintAxisVertical;
-    self.stack.spacing = 6;
-    [self.scroll addSubview:self.stack];
-
-    UILabel *t = [UILabel new];
-    t.text = @"NullRythm";
-    t.textColor = [UIColor systemYellowColor];
-    t.font = [UIFont boldSystemFontOfSize:17];
-    [self.stack addArrangedSubview:t];
-
-    UILabel *i1 = [UILabel new];
-    i1.text = [NSString stringWithFormat:@"image: %s", g_image];
-    i1.textColor = [UIColor whiteColor];
-    i1.font = [UIFont systemFontOfSize:11];
-    i1.numberOfLines = 0;
-    [self.stack addArrangedSubview:i1];
-
-    UILabel *i2 = [UILabel new];
-    i2.text = [NSString stringWithFormat:@"base: 0x%lx", g_base];
-    i2.textColor = [UIColor whiteColor];
-    i2.font = [UIFont monospacedSystemFontOfSize:11 weight:UIFontWeightRegular];
-    [self.stack addArrangedSubview:i2];
-
-    dispatch_async(dispatch_get_main_queue(), ^{
-        [self.stack layoutIfNeeded];
-        self.stack.frame = CGRectMake(12, 12, 260, self.stack.frame.size.height);
-        self.scroll.contentSize = CGSizeMake(284, self.stack.frame.size.height + 24);
-    });
-}
-@end
-
-static UIWindow *g_win = nil;
-
-@interface UIWindow (NRDrag)
-@end
-@implementation UIWindow (NRDrag)
-- (void)nr_drag:(UIPanGestureRecognizer *)g {
-    CGPoint t = [g translationInView:self];
-    CGRect f = self.frame;
-    f.origin.x += t.x; f.origin.y += t.y;
-    self.frame = f;
-    [g setTranslation:CGPointZero inView:self];
-}
-@end
-
-static void ShowMenu(void) {
-    dispatch_async(dispatch_get_main_queue(), ^{
-        UIWindowScene *scene = nil;
-        for (UIScene *s in UIApplication.sharedApplication.connectedScenes) {
-            if ([s isKindOfClass:UIWindowScene.class]) { scene = (UIWindowScene *)s; break; }
-        }
-        if (!scene) return;
-        g_win = [[UIWindow alloc] initWithWindowScene:scene];
-        g_win.windowLevel = UIWindowLevelAlert + 100;
-        g_win.backgroundColor = [UIColor clearColor];
-        g_win.rootViewController = [NRMenuVC new];
-        g_win.frame = CGRectMake(70, 120, 290, 260);
-        g_win.hidden = NO;
-        UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:g_win action:@selector(nr_drag:)];
-        [g_win addGestureRecognizer:pan];
-    });
-}
-
-#pragma mark - Install
 
 static void InstallHooks(void) {
+    TaleLog("[TaleMod] === install ===");
+
     MSHookFunction_p = (MSHookFunction_t)dlsym(RTLD_DEFAULT, "MSHookFunction");
-    if (!MSHookFunction_p) { NRLog("MSHookFunction missing"); return; }
+    if (!MSHookFunction_p) { TaleLog("[TaleMod] MSHookFunction not found"); return; }
+    TaleLog("[TaleMod] MSHookFunction=%p", MSHookFunction_p);
 
-    MSHookFunction_p(GV(RVA_MESSAGEMANAGER_RECEIVEMESSAGE), (void *)hook_recv, (void **)&orig_recv);
-    MSHookFunction_p(GV(RVA_MESSAGEMANAGER_CTOR),          (void *)hook_mmCtor, (void **)&orig_mmCtor);
-    MSHookFunction_p(GV(RVA_GAMEBUTTON_CTOR),              (void *)hook_gbCtor, (void **)&orig_gbCtor);
-    MSHookFunction_p(GV(RVA_HOMEPAGE_CTOR),                (void *)hook_homeCtor, (void **)&orig_homeCtor);
-    MSHookFunction_p(GV(RVA_CHARACTER_CTOR),               (void *)hook_charCtor, (void **)&orig_charCtor);
-    MSHookFunction_p(GV(RVA_MOVIECLIP_CTOR),               (void *)hook_mcCtor, (void **)&orig_mcCtor);
-    MSHookFunction_p(GV(RVA_NATIVEFONT_CTOR),              (void *)hook_fontCtor, (void **)&orig_fontCtor);
-    MSHookFunction_p(GV(RVA_NATIVEFONT_FORMATSTRING),      (void *)hook_fmt, (void **)&orig_fmt);
-    MSHookFunction_p(GV(RVA_STAGE_CTOR),                   (void *)hook_stageCtor, (void **)&orig_stageCtor);
-    MSHookFunction_p(GV(RVA_STAGE_SETVIEWPORT),            (void *)hook_setVP, (void **)&orig_setVP);
-    MSHookFunction_p(GV(RVA_LOGICDATATABLES_CTOR),         (void *)hook_ldtCtor, (void **)&orig_ldtCtor);
-    MSHookFunction_p(GV(RVA_LOGICDATATABLES_INITDATATABLE),(void *)hook_ldtInit, (void **)&orig_ldtInit);
-    MSHookFunction_p(GV(RVA_LOGICPROJECTILEDATA_CTOR),     (void *)hook_projCtor, (void **)&orig_projCtor);
-    MSHookFunction_p(GV(RVA_LOGICPROJECTILEDATA_GETINTVALUE),(void *)hook_projGetInt, (void **)&orig_projGetInt);
+    NSString *img = DetectGameImage();
+    if (!img) { TaleLog("[TaleMod] image not found"); return; }
+    TaleLog("[TaleMod] image=%s", img.UTF8String);
 
-    NRLog("all hooks installed");
+    uint64_t recvAddr = Resolve(img, RVA_MM_RECEIVEMESSAGE);
+    TaleLog("[TaleMod] recv=0x%llx", recvAddr);
+    if (!recvAddr) return;
+
+    if (!CheckJIT(recvAddr, 10)) {
+        TaleLog("[TaleMod] JIT unavailable, skipping hook");
+        return;
+    }
+
+    TaleLog("[TaleMod] installing recv hook");
+    MSHookFunction_p((void *)recvAddr, (void *)my_recv, (void **)&orig_recv);
+    TaleLog("[TaleMod] recv hooked orig=%p", orig_recv);
+    TaleLog("[TaleMod] === install done ===");
 }
 
 __attribute__((constructor))
-static void nr_init(void) {
-    NRLog("=== NullRythm init ===");
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)),
+static void tweak_init(void) {
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5.0 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
-        if (!DetectGame()) { NRLog("game not found"); return; }
+        TaleLog("[TaleMod] init");
         InstallHooks();
-        ShowMenu();
-        NRLog("=== done ===");
+        TaleLog("[TaleMod] === done ===");
     });
 }
