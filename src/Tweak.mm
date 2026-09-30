@@ -13,7 +13,7 @@ typedef void (*MSHookFunction_t)(void *symbol, void *hook, void **old);
 static MSHookFunction_t MSHookFunction_p = NULL;
 
 static uintptr_t g_base = 0;
-static char g_image[256] = {0};
+static char g_image[512] = {0};
 static FILE *g_log = NULL;
 
 static void NRLog(const char *fmt, ...) {
@@ -36,33 +36,35 @@ static void NRLog(const char *fmt, ...) {
 static BOOL DetectGame(void) {
     char execPath[PATH_MAX];
     uint32_t size = sizeof(execPath);
-    if (_NSGetExecutablePath(execPath, &size) == 0) {
-        NRLog("exec path: %s", execPath);
+    if (_NSGetExecutablePath(execPath, &size) != 0) {
+        NRLog("_NSGetExecutablePath failed");
+        return NO;
     }
+    NRLog("exec path: %s", execPath);
+
+    NSString *targetName = [[NSString stringWithUTF8String:execPath] lastPathComponent];
 
     for (uint32_t i = 0; i < _dyld_image_count(); i++) {
         const char *path = _dyld_get_image_name(i);
         if (!path) continue;
 
-        if (strstr(path, "/System/") || strstr(path, "/usr/") ||
-            strstr(path, "/private/preboot/") ||
-            strstr(path, "LiveContainer") || strstr(path, "SideStore")) continue;
-
         const struct mach_header_64 *hdr =
             (const struct mach_header_64 *)_dyld_get_image_header(i);
         if (!hdr || hdr->magic != MH_MAGIC_64) continue;
-        if (hdr->filetype != MH_EXECUTE) continue;
 
-        if (strstr(path, ".app/") == NULL &&
-            strstr(path, ".app") == NULL) continue;
+        NSString *imageName = [[NSString stringWithUTF8String:path] lastPathComponent];
+        if (![imageName isEqualToString:targetName]) continue;
+
+        if (strstr(path, "LiveContainer") || strstr(path, "SideStore") ||
+            strstr(path, "/System/") || strstr(path, "/usr/")) continue;
 
         g_base = (uintptr_t)hdr;
-        strncpy(g_image, basename((char *)path), sizeof(g_image) - 1);
-        NRLog(">>> game: %s base=%p", g_image, (void *)g_base);
+        strncpy(g_image, path, sizeof(g_image) - 1);
+        NRLog(">>> game: %s base=%p ft=%u", g_image, (void *)g_base, hdr->filetype);
         return YES;
     }
 
-    NRLog("game not found after scan");
+    NRLog("game not found: no image matches '%s'", targetName.UTF8String);
     return NO;
 }
 
@@ -236,7 +238,7 @@ static void *hook_fmt(void *self, void *out, void *fmt) {
     UILabel *i1 = [UILabel new];
     i1.text = [NSString stringWithFormat:@"image: %s", g_image];
     i1.textColor = [UIColor whiteColor];
-    i1.font = [UIFont systemFontOfSize:11];
+    i1.font = [UIFont systemFontOfSize:10];
     i1.numberOfLines = 0;
     [self.stack addArrangedSubview:i1];
 
@@ -279,7 +281,7 @@ static void ShowMenu(void) {
         g_win.windowLevel = UIWindowLevelAlert + 100;
         g_win.backgroundColor = [UIColor clearColor];
         g_win.rootViewController = [NRMenuVC new];
-        g_win.frame = CGRectMake(70, 120, 290, 260);
+        g_win.frame = CGRectMake(70, 120, 290, 220);
         g_win.hidden = NO;
         UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:g_win action:@selector(nr_drag:)];
         [g_win addGestureRecognizer:pan];
