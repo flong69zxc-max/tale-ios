@@ -7,10 +7,12 @@
 #import <libgen.h>
 #import <string.h>
 #import <stdarg.h>
+#import <mach/mach.h>
 #import "offsets.h"
 
-typedef void (*MSHookFunction_t)(void *symbol, void *hook, void **old);
+typedef kern_return_t (*MSHookFunction_t)(void *symbol, void *hook, void **old);
 static MSHookFunction_t MSHookFunction_p = NULL;
+static void *g_hooklib = NULL;
 
 static uintptr_t g_base = 0;
 static char g_image[512] = {0};
@@ -30,6 +32,43 @@ static void NRLog(const char *fmt, ...) {
     va_end(ap);
     fflush(g_log);
 }
+
+#pragma mark - Hooker loader
+
+static void *LoadHooker(void) {
+    const char *paths[] = {
+        "/var/jb/usr/lib/libellekit.dylib",
+        "/usr/lib/libellekit.dylib",
+        "/var/jb/usr/lib/libhooker.dylib",
+        "/usr/lib/libhooker.dylib",
+        "/var/jb/usr/lib/libsubstrate.dylib",
+        "/usr/lib/libsubstrate.dylib",
+        "/var/jb/usr/lib/libsubstitute.dylib",
+        "/usr/lib/libsubstitute.dylib",
+        NULL
+    };
+    for (int i = 0; paths[i]; i++) {
+        void *h = dlopen(paths[i], RTLD_NOW | RTLD_GLOBAL);
+        if (h) {
+            void *f = dlsym(h, "MSHookFunction");
+            if (f) {
+                NRLog("hooker loaded from %s f=%p", paths[i], f);
+                g_hooklib = h;
+                return f;
+            }
+            dlclose(h);
+        }
+    }
+    void *f = dlsym(RTLD_DEFAULT, "MSHookFunction");
+    if (f) {
+        NRLog("hooker from RTLD_DEFAULT f=%p", f);
+        return f;
+    }
+    NRLog("no hooker found");
+    return NULL;
+}
+
+#pragma mark - Detect game image
 
 static BOOL DetectGame(void) {
     char execPath[PATH_MAX];
@@ -72,6 +111,7 @@ static inline void *GV(uint64_t rva) { return (void *)(g_base + rva); }
 
 typedef void (*fn_recv_t)(void *self, void *msg, void *a, void *b, void *c, void *d);
 static fn_recv_t orig_recv = NULL;
+static BOOL g_recv_broken = NO;
 
 static void hook_recv(void *self, void *msg, void *a, void *b, void *c, void *d) {
     static __thread int guard = 0;
@@ -82,125 +122,14 @@ static void hook_recv(void *self, void *msg, void *a, void *b, void *c, void *d)
         NRLog("recv self=%p msg=%p id=0x%x", self, msg, msgId);
         guard = 0;
     }
-    if (orig_recv) orig_recv(self, msg, a, b, c, d);
-}
-
-typedef void *(*fn_gbCtor_t)(void *self, void *clip);
-static fn_gbCtor_t orig_gbCtor = NULL;
-
-static void *hook_gbCtor(void *self, void *clip) {
-    void *r = orig_gbCtor ? orig_gbCtor(self, clip) : self;
-    NRLog("GameButton self=%p clip=%p", self, clip);
-    return r;
-}
-
-typedef void *(*fn_charCtor_t)(void *self, void *a2, void *a3, void *a4);
-static fn_charCtor_t orig_charCtor = NULL;
-
-static void *hook_charCtor(void *self, void *a2, void *a3, void *a4) {
-    void *r = orig_charCtor ? orig_charCtor(self, a2, a3, a4) : self;
-    NRLog("Character self=%p", self);
-    return r;
-}
-
-typedef void *(*fn_homeCtor_t)(void *self, void *a2);
-static fn_homeCtor_t orig_homeCtor = NULL;
-
-static void *hook_homeCtor(void *self, void *a2) {
-    void *r = orig_homeCtor ? orig_homeCtor(self, a2) : self;
-    NRLog("HomePage self=%p", self);
-    return r;
-}
-
-typedef void *(*fn_mcCtor_t)(void *self, void *a2);
-static fn_mcCtor_t orig_mcCtor = NULL;
-
-static void *hook_mcCtor(void *self, void *a2) {
-    void *r = orig_mcCtor ? orig_mcCtor(self, a2) : self;
-    NRLog("MovieClip self=%p", self);
-    return r;
-}
-
-typedef void *(*fn_fontCtor_t)(void *self, void *a2);
-static fn_fontCtor_t orig_fontCtor = NULL;
-
-static void *hook_fontCtor(void *self, void *a2) {
-    void *r = orig_fontCtor ? orig_fontCtor(self, a2) : self;
-    NRLog("NativeFont self=%p", self);
-    return r;
-}
-
-typedef void *(*fn_stageCtor_t)(void *self, void *a2);
-static fn_stageCtor_t orig_stageCtor = NULL;
-
-static void *hook_stageCtor(void *self, void *a2) {
-    void *r = orig_stageCtor ? orig_stageCtor(self, a2) : self;
-    NRLog("Stage self=%p", self);
-    return r;
-}
-
-typedef void (*fn_setVP_t)(void *self, void *a2, void *a3, void *a4);
-static fn_setVP_t orig_setVP = NULL;
-
-static void hook_setVP(void *self, void *a2, void *a3, void *a4) {
-    static BOOL once = NO;
-    if (!once) { once = YES; NRLog("Stage::setViewport self=%p", self); }
-    if (orig_setVP) orig_setVP(self, a2, a3, a4);
-}
-
-typedef void *(*fn_ldtCtor_t)(void *self, void *a2);
-static fn_ldtCtor_t orig_ldtCtor = NULL;
-
-static void *hook_ldtCtor(void *self, void *a2) {
-    void *r = orig_ldtCtor ? orig_ldtCtor(self, a2) : self;
-    NRLog("LogicDataTables self=%p", self);
-    return r;
-}
-
-typedef void (*fn_ldtInit_t)(void *self, int idx, void *a3);
-static fn_ldtInit_t orig_ldtInit = NULL;
-
-static void hook_ldtInit(void *self, int idx, void *a3) {
-    NRLog("initDataTable self=%p idx=%d", self, idx);
-    if (orig_ldtInit) orig_ldtInit(self, idx, a3);
-}
-
-typedef void *(*fn_projCtor_t)(void *self, void *a2);
-static fn_projCtor_t orig_projCtor = NULL;
-
-static void *hook_projCtor(void *self, void *a2) {
-    void *r = orig_projCtor ? orig_projCtor(self, a2) : self;
-    NRLog("LogicProjectileData self=%p", self);
-    return r;
-}
-
-typedef int (*fn_projGetInt_t)(void *self, int col, int def);
-static fn_projGetInt_t orig_projGetInt = NULL;
-
-static int hook_projGetInt(void *self, int col, int def) {
-    int v = orig_projGetInt ? orig_projGetInt(self, col, def) : def;
-    static int logged = 0;
-    if (logged < 200) { logged++; NRLog("projGetInt self=%p col=%d -> %d", self, col, v); }
-    return v;
-}
-
-typedef void *(*fn_mmCtor_t)(void *self, void *a2);
-static fn_mmCtor_t orig_mmCtor = NULL;
-
-static void *hook_mmCtor(void *self, void *a2) {
-    void *r = orig_mmCtor ? orig_mmCtor(self, a2) : self;
-    NRLog("MessageManager self=%p", self);
-    return r;
-}
-
-typedef void *(*fn_fmt_t)(void *self, void *out, void *fmt);
-static fn_fmt_t orig_fmt = NULL;
-
-static void *hook_fmt(void *self, void *out, void *fmt) {
-    static int logged = 0;
-    if (logged < 50) { logged++; NRLog("formatString self=%p out=%p fmt=%p", self, out, fmt); }
-    if (orig_fmt) return orig_fmt(self, out, fmt);
-    return out;
+    if (orig_recv) {
+        orig_recv(self, msg, a, b, c, d);
+    } else {
+        if (!g_recv_broken) {
+            g_recv_broken = YES;
+            NRLog("orig_recv is NULL, cannot forward original call");
+        }
+    }
 }
 
 #pragma mark - UI
@@ -246,6 +175,18 @@ static void *hook_fmt(void *self, void *out, void *fmt) {
     i2.font = [UIFont monospacedSystemFontOfSize:11 weight:UIFontWeightRegular];
     [self.stack addArrangedSubview:i2];
 
+    UILabel *i3 = [UILabel new];
+    i3.text = [NSString stringWithFormat:@"hooker: %p", MSHookFunction_p];
+    i3.textColor = [UIColor whiteColor];
+    i3.font = [UIFont monospacedSystemFontOfSize:10 weight:UIFontWeightRegular];
+    [self.stack addArrangedSubview:i3];
+
+    UILabel *i4 = [UILabel new];
+    i4.text = [NSString stringWithFormat:@"orig_recv: %p", orig_recv];
+    i4.textColor = [UIColor whiteColor];
+    i4.font = [UIFont monospacedSystemFontOfSize:10 weight:UIFontWeightRegular];
+    [self.stack addArrangedSubview:i4];
+
     dispatch_async(dispatch_get_main_queue(), ^{
         [self.stack layoutIfNeeded];
         self.stack.frame = CGRectMake(12, 12, 260, self.stack.frame.size.height);
@@ -280,7 +221,7 @@ static void ShowMenu(void) {
             g_win.windowLevel = UIWindowLevelAlert + 100;
             g_win.backgroundColor = [UIColor clearColor];
             g_win.rootViewController = [NRMenuVC new];
-            g_win.frame = CGRectMake(70, 120, 290, 220);
+            g_win.frame = CGRectMake(70, 120, 290, 260);
             g_win.hidden = NO;
             UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:g_win action:@selector(nr_drag:)];
             [g_win addGestureRecognizer:pan];
@@ -301,8 +242,9 @@ static void InstallOne(const char *name, uint64_t rva, void *hook, void **orig) 
     void *addr = (void *)(g_base + rva);
     NRLog("installing %s rva=0x%llx addr=%p", name, rva, addr);
     fflush(g_log);
-    MSHookFunction_p(addr, hook, orig);
-    NRLog("  -> ok %s orig=%p", name, orig ? *orig : NULL);
+    *orig = NULL;
+    kern_return_t kr = MSHookFunction_p(addr, hook, orig);
+    NRLog("  -> %s kr=%d orig=%p", name, kr, orig ? *orig : NULL);
     fflush(g_log);
 }
 
@@ -310,8 +252,11 @@ static void InstallHooks(void) {
     NRLog("=== InstallHooks begin ===");
     fflush(g_log);
 
-    MSHookFunction_p = (MSHookFunction_t)dlsym(RTLD_DEFAULT, "MSHookFunction");
-    if (!MSHookFunction_p) { NRLog("MSHookFunction missing"); return; }
+    MSHookFunction_p = (MSHookFunction_t)LoadHooker();
+    if (!MSHookFunction_p) {
+        NRLog("MSHookFunction missing");
+        return;
+    }
     NRLog("MSHookFunction = %p", MSHookFunction_p);
     fflush(g_log);
 
