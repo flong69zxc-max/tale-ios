@@ -260,19 +260,15 @@ jobs:
 
           Theos tweak for Nulls Brawl on iOS 27 / LiveContainer.
 
-          ## Build
-
-          Push to `main` - GitHub Actions builds `TaleMod.dylib`.
-
           ## Install
 
-          1. Download `TaleMod` artifact from Actions.
-          2. Unpack `TaleMod.dylib`.
-          3. Copy to `Documents/Tweaks/` inside LiveContainer.
-          4. Remove `Titanox.dylib` from the same folder - it conflicts with StikDebug.
+          1. Download TaleMod artifact from Actions.
+          2. Unpack TaleMod.dylib.
+          3. Copy to Documents/Tweaks/ inside LiveContainer.
+          4. Remove Titanox.dylib from the same folder.
           5. Launch NB via LiveContainer.
           6. Enable JIT for NB process via StikDebug.
-          7. Log: `Documents/talemod.log` in NB data container.
+          7. Log: Documents/talemod.log in NB data container.
           README_EOF
 
           echo "[+] bootstrap done"
@@ -295,11 +291,11 @@ jobs:
         run: |
           set -euo pipefail
           export PATH="/opt/homebrew/opt/make/libexec/gnubin:$PATH"
-          gmake -j"$(sysctl -n hw.nc/pu)" ARCHS=arm64 CC=clang CuploadXX=cl-artang++
+          gmake -j"$(sysctl -n hw.ncpu)" ARCHS=arm64 CC=clang CXX=clang++
 
       - name: Package
-ifact        shell: bash
-       @ run: |
+        shell: bash
+        run: |
           set -euo pipefail
           mkdir -p out
           find .theos/obj -name '*.dylib' -exec cp {} out/TaleMod.dylib \;
@@ -307,7 +303,7 @@ ifact        shell: bash
           ls -la out/
 
       - name: Upload artifact
-        uses: actionsv4
+        uses: actions/upload-artifact@v4
         with:
           name: TaleMod
           path: out/TaleMod.dylib
