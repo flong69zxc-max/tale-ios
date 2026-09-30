@@ -1,29 +1,13 @@
 #ifndef OFFSETS_H
 #define OFFSETS_H
 
-#define RVA_NATIVEFONT_FORMATSTRING                 0xb3fde8
-#define RVA_MESSAGEMANAGER_RECEIVEMESSAGE           0x75cce0
-#define RVA_LOGICDATATABLES_INITDATATABLE           0x9a8f3c
-#define RVA_LOGICPROJECTILEDATA_GETINTVALUE         0x9cb098
-#define RVA_STAGE_SETVIEWPORT                       0xba17b8
-#define RVA_GAMEBUTTON_CTOR                         0x5425b0
-#define RVA_HOMEPAGE_CTOR                           0x86eb80
-#define RVA_CHARACTER_CTOR                          0x9e3100
-#define RVA_LOGICDATATABLES_CTOR                    0x9a4cbc
-#define RVA_LOGICPROJECTILEDATA_CTOR                0x9cb098
-#define RVA_MESSAGEMANAGER_CTOR                     0x75bb1c
-#define RVA_MOVIECLIP_CTOR                          0xb5f028
-#define RVA_NATIVEFONT_CTOR                         0xb3ec50
-#define RVA_STAGE_CTOR                              0xb9ee6c
+#define RVA_MM_RECEIVEMESSAGE                        0x75cce0
+#define RVA_MM_CTOR                                  0x75bb1c
+#define RVA_NATIVEFONT_FORMATSTRING                  0xb3fde8
+#define RVA_LOGICDATATABLES_INITDATATABLE            0x9a8f3c
+#define RVA_LOGICPROJECTILEDATA_GETINTVALUEFROMCOLUMN 0x9cb098
+#define RVA_STAGE_SETVIEWPORT                        0xba17b8
 
-#define VT_GAMEBUTTON                               0xf9b0f8
-#define VT_HOMEPAGE                                 0xfe4008
-#define VT_CHARACTER                                0xff45c0
-#define VT_LOGICDATATABLES                          0xff2478
-#define VT_LOGICPROJECTILEDATA                      0xff3aa0
-#define VT_MESSAGEMANAGER                           0xfd57e8
-#define VT_MOVIECLIP                                0x1006150
-#define VT_NATIVEFONT                               0x1005858
-#define VT_STAGE                                    0x10091b0
+#define VT_MM                                        0xfd57e8
 
 #endif
