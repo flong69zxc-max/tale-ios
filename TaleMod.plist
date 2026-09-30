@@ -1,0 +1,10 @@
+{
+    Filter = {
+        Bundles = (
+            "com.supercell.brawlstars",
+            "com.nulls.brawl",
+            "com.nulls.*",
+            "com.kdt.livecontainer*"
+        );
+    };
+}

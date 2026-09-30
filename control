@@ -1,0 +1,9 @@
+Package: com.talemod.ios
+Name: TaleMod
+Version: 0.1.0
+Architecture: iphoneos-arm64
+Description: Tale Stars iOS tweak
+Maintainer: you
+Author: you
+Section: Tweaks
+Depends: mobilesubstrate
