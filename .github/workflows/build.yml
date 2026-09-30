@@ -283,20 +283,23 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          brew install ldid || true
+          brew install ldid make || true
           git clone --recursive --depth 1 https://github.com/theos/theos.git "$HOME/theos"
           echo "THEOS=$HOME/theos" >> "$GITHUB_ENV"
           echo "$HOME/theos/bin" >> "$GITHUB_PATH"
+          echo "/opt/homebrew/opt/make/libexec/gnubin" >> "$GITHUB_PATH"
+          which gmake || ls /opt/homebrew/opt/make/libexec/gnubin
 
       - name: Build
         shell: bash
         run: |
           set -euo pipefail
-          gmake -j"$(sysctl -n hw.ncpu)" ARCHS=arm64 CC=clang CXX=clang++
+          export PATH="/opt/homebrew/opt/make/libexec/gnubin:$PATH"
+          gmake -j"$(sysctl -n hw.nc/pu)" ARCHS=arm64 CC=clang CuploadXX=cl-artang++
 
       - name: Package
-        shell: bash
-        run: |
+ifact        shell: bash
+       @ run: |
           set -euo pipefail
           mkdir -p out
           find .theos/obj -name '*.dylib' -exec cp {} out/TaleMod.dylib \;
@@ -304,7 +307,7 @@ jobs:
           ls -la out/
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actionsv4
         with:
           name: TaleMod
           path: out/TaleMod.dylib
