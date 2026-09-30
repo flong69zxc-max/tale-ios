@@ -1,7 +1,6 @@
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
-#import <objc/message.h>
 #import <dlfcn.h>
 #import <mach-o/dyld.h>
 #import <mach-o/loader.h>
@@ -11,9 +10,16 @@
 #import <stdarg.h>
 #import "offsets.h"
 
-static FILE *g_log = NULL;
+typedef kern_return_t (*MSHookFunction_t)(void *symbol, void *hook, void **old);
+typedef void (*MSHookMessageEx_t)(Class cls, SEL sel, IMP hook, IMP *old);
+
+static MSHookFunction_t MSHookFunction_p = NULL;
+static MSHookMessageEx_t MSHookMessageEx_p = NULL;
+static char g_hooker_path[512] = {0};
+
 static uintptr_t g_base = 0;
 static char g_image[512] = {0};
+static FILE *g_log = NULL;
 
 static void NRLog(const char *fmt, ...) {
     if (!g_log) {
@@ -30,185 +36,60 @@ static void NRLog(const char *fmt, ...) {
     fflush(g_log);
 }
 
-static void DumpEnvironment(void) {
-    NRLog("--- env ---");
-    NRLog("pid=%d", getpid());
-    NRLog("NSHomeDirectory=%s", NSHomeDirectory().UTF8String);
-    NRLog("bundleID=%s", [NSBundle mainBundle].bundleIdentifier.UTF8String);
-    NRLog("execPath=%s", [NSBundle mainBundle].executablePath.UTF8String);
-    NSProcessInfo *pi = [NSProcessInfo processInfo];
-    NRLog("osVersion=%s", pi.operatingSystemVersionString.UTF8String);
-    NRLog("physicalMemory=%llu", pi.physicalMemory);
-    NRLog("processorCount=%lu", (unsigned long)pi.processorCount);
-    NRLog("isJailbroken=%d", [[NSFileManager defaultManager] fileExistsAtPath:@"/var/jb"] ? 1 : 0);
-}
+#pragma mark - Hooker loading (ElleKit preferred)
 
-static void DumpDyldImages(void) {
-    uint32_t n = _dyld_image_count();
-    NRLog("--- dyld images (%u) ---", n);
-    for (uint32_t i = 0; i < n; i++) {
-        const char *path = _dyld_get_image_name(i);
-        const struct mach_header_64 *hdr =
-            (const struct mach_header_64 *)_dyld_get_image_header(i);
-        if (!path || !hdr) continue;
-        const char *bn = basename((char *)path);
-        NRLog("[%u] ft=%u base=%p name=%s",
-              i, hdr->filetype, (void *)hdr, bn);
+static BOOL TryLoadHooker(const char *path) {
+    void *h = dlopen(path, RTLD_NOW | RTLD_GLOBAL);
+    if (!h) return NO;
+
+    void *fFn  = dlsym(h, "MSHookFunction");
+    void *fMsg = dlsym(h, "MSHookMessageEx");
+    if (!fFn || !fMsg) { dlclose(h); return NO; }
+
+    Dl_info info = {0};
+    if (dladdr(fFn, &info) && info.dli_fname) {
+        strncpy(g_hooker_path, info.dli_fname, sizeof(g_hooker_path) - 1);
     }
+    MSHookFunction_p  = (MSHookFunction_t)fFn;
+    MSHookMessageEx_p = (MSHookMessageEx_t)fMsg;
+    NRLog("hooker loaded: %s -> fn=%p msg=%p (%s)", path, fFn, fMsg, g_hooker_path);
+    return YES;
 }
 
-static void DumpHooker(void) {
-    NRLog("--- hooker symbols ---");
-    const char *names[] = {
-        "MSHookFunction",
-        "MSHookMessageEx",
-        "rebind_symbols",
-        "rebind_symbols_image",
-        "fishhook_remap",
-        "LCHookFunction",
-        "LCFindSymbol",
-        "SubstrateHookFunction",
-        "SubstrateHookFunctionRet",
-        "SubstituteHookFunction",
-        "hook_function",
+static void LoadHooker(void) {
+    const char *preferred[] = {
+        "/var/jb/usr/lib/ellekit/libellekit.dylib",
+        "/var/jb/usr/lib/libellekit.dylib",
+        "/usr/lib/libellekit.dylib",
+        "/var/jb/usr/lib/libhooker.dylib",
+        "/usr/lib/libhooker.dylib",
         NULL
     };
-    for (int i = 0; names[i]; i++) {
-        void *p = dlsym(RTLD_DEFAULT, names[i]);
-        if (p) {
-            Dl_info info = {0};
-            if (dladdr(p, &info)) {
-                NRLog("%-24s = %p  %s  (%s)",
-                      names[i], p,
-                      info.dli_fname ? basename((char*)info.dli_fname) : "?",
-                      info.dli_sname ? info.dli_sname : "?");
-            } else {
-                NRLog("%-24s = %p  (dladdr failed)", names[i], p);
+    for (int i = 0; preferred[i]; i++) {
+        if (TryLoadHooker(preferred[i])) return;
+    }
+
+    void *f = dlsym(RTLD_DEFAULT, "MSHookFunction");
+    if (f) {
+        Dl_info info = {0};
+        if (dladdr(f, &info) && info.dli_fname) {
+            strncpy(g_hooker_path, info.dli_fname, sizeof(g_hooker_path) - 1);
+            if (strstr(info.dli_fname, "CydiaSubstrate") ||
+                strstr(info.dli_fname, "libsubstrate")) {
+                NRLog("rejecting CydiaSubstrate: %s", info.dli_fname);
+                MSHookFunction_p = NULL;
+                return;
             }
         }
+        MSHookFunction_p = (MSHookFunction_t)f;
+        MSHookMessageEx_p = (MSHookMessageEx_t)dlsym(RTLD_DEFAULT, "MSHookMessageEx");
+        NRLog("hooker from RTLD_DEFAULT fn=%p msg=%p (%s)", f, MSHookMessageEx_p, g_hooker_path);
+    } else {
+        NRLog("no hooker found");
     }
 }
 
-static void DumpObjcClasses(void) {
-    NRLog("--- objc classes of interest ---");
-    const char *targets[] = {
-        "BattleScreen",
-        "BattleMode",
-        "LogicBattleModeClient",
-        "LogicGameObjectClient",
-        "GameButton",
-        "Character",
-        "Stage",
-        "MovieClip",
-        "NativeFont",
-        "MessageManager",
-        NULL
-    };
-    for (int i = 0; targets[i]; i++) {
-        Class c = objc_getClass(targets[i]);
-        if (!c) continue;
-        NRLog("class %s = %p", targets[i], (__bridge void *)c);
-        unsigned int count = 0;
-        Method *methods = class_copyMethodList(c, &count);
-        if (methods) {
-            for (unsigned int j = 0; j < count && j < 20; j++) {
-                NRLog("  -[%s %s]", targets[i], sel_getName(method_getName(methods[j])));
-            }
-            if (count > 20) NRLog("  ...(%u more)", count - 20);
-            free(methods);
-        }
-    }
-}
-
-static BOOL LooksLikeObjcMethod(uintptr_t addr) {
-    uint32_t *p = (uint32_t *)addr;
-    uint32_t first = p[0];
-    uint32_t second = p[1];
-    uint32_t adrp = first & 0x9F000000;
-    if (adrp == 0x90000000) {
-        uint32_t next = second & 0xFC000000;
-        if (next == 0x94000000) return YES;
-        if (next == 0x14000000) return YES;
-    }
-    return NO;
-}
-
-static BOOL AddressInText(uintptr_t addr) {
-    for (uint32_t i = 0; i < _dyld_image_count(); i++) {
-        const struct mach_header_64 *hdr =
-            (const struct mach_header_64 *)_dyld_get_image_header(i);
-        if (!hdr || hdr->magic != MH_MAGIC_64) continue;
-        if (addr >= (uintptr_t)hdr && addr < (uintptr_t)hdr + 0x40000000) {
-            return YES;
-        }
-    }
-    return NO;
-}
-
-static void DumpRvaProbe(void) {
-    NRLog("--- rva probe ---");
-    struct { const char *name; uint64_t rva; } items[] = {
-        {"GameButton_ctor",          RVA_GAMEBUTTON_CTOR},
-        {"Character_ctor",           RVA_CHARACTER_CTOR},
-        {"Stage_setViewport",        RVA_STAGE_SETVIEWPORT},
-        {"Stage_ctor",               RVA_STAGE_CTOR},
-        {"HomePage_ctor",            RVA_HOMEPAGE_CTOR},
-        {"MovieClip_ctor",           RVA_MOVIECLIP_CTOR},
-        {"NativeFont_ctor",          RVA_NATIVEFONT_CTOR},
-        {"NativeFont_formatString",  RVA_NATIVEFONT_FORMATSTRING},
-        {"LogicDataTables_ctor",     RVA_LOGICDATATABLES_CTOR},
-        {"LogicDataTables_init",     RVA_LOGICDATATABLES_INITDATATABLE},
-        {"LogicProjectileData_ctor", RVA_LOGICPROJECTILEDATA_CTOR},
-        {"LogicProjectileData_getI", RVA_LOGICPROJECTILEDATA_GETINTVALUE},
-        {"MessageManager_ctor",      RVA_MESSAGEMANAGER_CTOR},
-        {"MessageManager_recv",      RVA_MESSAGEMANAGER_RECEIVEMESSAGE},
-        {NULL, 0}
-    };
-    for (int i = 0; items[i].name; i++) {
-        uintptr_t addr = g_base + items[i].rva;
-        NRLog("%-28s rva=0x%-8llx addr=%p inText=%d objc=%d",
-              items[i].name, items[i].rva, (void*)addr,
-              AddressInText(addr),
-              LooksLikeObjcMethod(addr));
-    }
-}
-
-typedef void (*MSHookMessageEx_t)(Class cls, SEL sel, IMP hook, IMP *old);
-static MSHookMessageEx_t MSHookMessageEx_p = NULL;
-
-static IMP g_orig_sendAction = NULL;
-static int g_sendActionCount = 0;
-
-static BOOL my_sendAction(id self, SEL _cmd, SEL action, id target, id sender, UIEvent *event) {
-    g_sendActionCount++;
-    if (g_sendActionCount < 30) {
-        NRLog("sendAction #%d self=%s sel=%s target=%s",
-              g_sendActionCount,
-              object_getClassName(self),
-              sel_getName(action),
-              target ? object_getClassName(target) : "nil");
-    }
-    if (g_orig_sendAction) {
-        return ((BOOL(*)(id,SEL,SEL,id,id,UIEvent*))g_orig_sendAction)(self, _cmd, action, target, sender, event);
-    }
-    return NO;
-}
-
-static void TestObjcHook(void) {
-    NRLog("--- objc hook test ---");
-    MSHookMessageEx_p = (MSHookMessageEx_t)dlsym(RTLD_DEFAULT, "MSHookMessageEx");
-    NRLog("MSHookMessageEx = %p", MSHookMessageEx_p);
-    if (!MSHookMessageEx_p) return;
-
-    Class uiapp = objc_getClass("UIApplication");
-    if (!uiapp) { NRLog("UIApplication class not found"); return; }
-
-    SEL sel = sel_registerName("sendAction:to:from:forEvent:");
-    IMP orig = NULL;
-    MSHookMessageEx_p(uiapp, sel, (IMP)my_sendAction, &orig);
-    g_orig_sendAction = orig;
-    NRLog("hooked sendAction, orig=%p", orig);
-}
+#pragma mark - Detect game
 
 static BOOL DetectGame(void) {
     char execPath[PATH_MAX];
@@ -226,10 +107,198 @@ static BOOL DetectGame(void) {
         if (strstr(path, "LiveContainer") || strstr(path, "/System/")) continue;
         g_base = (uintptr_t)hdr;
         strncpy(g_image, path, sizeof(g_image) - 1);
+        NRLog(">>> game: %s base=%p", g_image, (void*)g_base);
         return YES;
     }
+    NRLog("game not found");
     return NO;
 }
+
+static inline void *GV(uint64_t rva) { return (void *)(g_base + rva); }
+
+#pragma mark - Hooks
+
+typedef void (*fn_recv_t)(void *self, void *msg, void *a, void *b, void *c, void *d);
+static fn_recv_t orig_recv = NULL;
+static int g_recv_count = 0;
+
+static void hook_recv(void *self, void *msg, void *a, void *b, void *c, void *d) {
+    static __thread int guard = 0;
+    if (!guard) {
+        guard = 1;
+        g_recv_count++;
+        uint32_t msgId = 0;
+        if (msg) memcpy(&msgId, msg, 4);
+        if (g_recv_count < 50 || (g_recv_count % 100 == 0)) {
+            NRLog("recv #%d self=%p msg=%p id=0x%x", g_recv_count, self, msg, msgId);
+        }
+        guard = 0;
+    }
+    if (orig_recv) orig_recv(self, msg, a, b, c, d);
+}
+
+typedef void *(*fn_mmCtor_t)(void *self, void *a2);
+static fn_mmCtor_t orig_mmCtor = NULL;
+
+static void *hook_mmCtor(void *self, void *a2) {
+    NRLog("MessageManager self=%p", self);
+    return orig_mmCtor ? orig_mmCtor(self, a2) : self;
+}
+
+typedef void *(*fn_gbCtor_t)(void *self, void *clip);
+static fn_gbCtor_t orig_gbCtor = NULL;
+static int g_gb_count = 0;
+
+static void *hook_gbCtor(void *self, void *clip) {
+    g_gb_count++;
+    if (g_gb_count < 50 || (g_gb_count % 100 == 0)) {
+        NRLog("GameButton #%d self=%p clip=%p", g_gb_count, self, clip);
+    }
+    return orig_gbCtor ? orig_gbCtor(self, clip) : self;
+}
+
+typedef void *(*fn_charCtor_t)(void *self, void *a2, void *a3, void *a4);
+static fn_charCtor_t orig_charCtor = NULL;
+static int g_char_count = 0;
+
+static void *hook_charCtor(void *self, void *a2, void *a3, void *a4) {
+    g_char_count++;
+    if (g_char_count < 100 || (g_char_count % 100 == 0)) {
+        NRLog("Character #%d self=%p", g_char_count, self);
+    }
+    return orig_charCtor ? orig_charCtor(self, a2, a3, a4) : self;
+}
+
+typedef void (*fn_setVP_t)(void *self, void *a2, void *a3, void *a4);
+static fn_setVP_t orig_setVP = NULL;
+static int g_vp_count = 0;
+
+static void hook_setVP(void *self, void *a2, void *a3, void *a4) {
+    g_vp_count++;
+    if (g_vp_count < 10) NRLog("setViewport #%d self=%p", g_vp_count, self);
+    if (orig_setVP) orig_setVP(self, a2, a3, a4);
+}
+
+typedef void *(*fn_homeCtor_t)(void *self, void *a2);
+static fn_homeCtor_t orig_homeCtor = NULL;
+
+static void *hook_homeCtor(void *self, void *a2) {
+    NRLog("HomePage self=%p", self);
+    return orig_homeCtor ? orig_homeCtor(self, a2) : self;
+}
+
+typedef void *(*fn_mcCtor_t)(void *self, void *a2);
+static fn_mcCtor_t orig_mcCtor = NULL;
+
+static void *hook_mcCtor(void *self, void *a2) {
+    return orig_mcCtor ? orig_mcCtor(self, a2) : self;
+}
+
+typedef void *(*fn_fontCtor_t)(void *self, void *a2);
+static fn_fontCtor_t orig_fontCtor = NULL;
+
+static void *hook_fontCtor(void *self, void *a2) {
+    return orig_fontCtor ? orig_fontCtor(self, a2) : self;
+}
+
+typedef void *(*fn_fmt_t)(void *self, void *out, void *fmt);
+static fn_fmt_t orig_fmt = NULL;
+
+static void *hook_fmt(void *self, void *out, void *fmt) {
+    return orig_fmt ? orig_fmt(self, out, fmt) : out;
+}
+
+typedef void *(*fn_ldtCtor_t)(void *self, void *a2);
+static fn_ldtCtor_t orig_ldtCtor = NULL;
+
+static void *hook_ldtCtor(void *self, void *a2) {
+    NRLog("LogicDataTables self=%p", self);
+    return orig_ldtCtor ? orig_ldtCtor(self, a2) : self;
+}
+
+typedef void (*fn_ldtInit_t)(void *self, int idx, void *a3);
+static fn_ldtInit_t orig_ldtInit = NULL;
+
+static void hook_ldtInit(void *self, int idx, void *a3) {
+    NRLog("initDataTable self=%p idx=%d", self, idx);
+    if (orig_ldtInit) orig_ldtInit(self, idx, a3);
+}
+
+typedef void *(*fn_projCtor_t)(void *self, void *a2);
+static fn_projCtor_t orig_projCtor = NULL;
+
+static void *hook_projCtor(void *self, void *a2) {
+    NRLog("LogicProjectileData self=%p", self);
+    return orig_projCtor ? orig_projCtor(self, a2) : self;
+}
+
+typedef int (*fn_projGetInt_t)(void *self, int col, int def);
+static fn_projGetInt_t orig_projGetInt = NULL;
+
+static int hook_projGetInt(void *self, int col, int def) {
+    int v = orig_projGetInt ? orig_projGetInt(self, col, def) : def;
+    static int logged = 0;
+    if (logged < 100) { logged++; NRLog("projGetInt self=%p col=%d -> %d", self, col, v); }
+    return v;
+}
+
+#pragma mark - Install
+
+static int g_hooks_ok = 0;
+static int g_hooks_fail = 0;
+
+static void InstallOne(const char *name, uint64_t rva, void *hook, void **orig) {
+    if (!MSHookFunction_p) { NRLog("skip %s: no hooker", name); g_hooks_fail++; return; }
+    void *addr = (void *)(g_base + rva);
+    NRLog("installing %s rva=0x%llx addr=%p", name, rva, addr);
+    fflush(g_log);
+    *orig = NULL;
+    kern_return_t kr = MSHookFunction_p(addr, hook, orig);
+    NRLog("  -> %s kr=%d orig=%p", name, kr, orig ? *orig : NULL);
+    fflush(g_log);
+    if (orig && *orig) g_hooks_ok++; else g_hooks_fail++;
+}
+
+static void InstallHooks(void) {
+    NRLog("=== InstallHooks begin ===");
+    LoadHooker();
+    if (!MSHookFunction_p) {
+        NRLog("no hooker available");
+        return;
+    }
+
+    InstallOne("MessageManager::receiveMessage", RVA_MESSAGEMANAGER_RECEIVEMESSAGE,
+               (void*)hook_recv, (void**)&orig_recv);
+    InstallOne("MessageManager::ctor", RVA_MESSAGEMANAGER_CTOR,
+               (void*)hook_mmCtor, (void**)&orig_mmCtor);
+    InstallOne("GameButton::ctor", RVA_GAMEBUTTON_CTOR,
+               (void*)hook_gbCtor, (void**)&orig_gbCtor);
+    InstallOne("Character::ctor", RVA_CHARACTER_CTOR,
+               (void*)hook_charCtor, (void**)&orig_charCtor);
+    InstallOne("Stage::setViewport", RVA_STAGE_SETVIEWPORT,
+               (void*)hook_setVP, (void**)&orig_setVP);
+    InstallOne("HomePage::ctor", RVA_HOMEPAGE_CTOR,
+               (void*)hook_homeCtor, (void**)&orig_homeCtor);
+    InstallOne("MovieClip::ctor", RVA_MOVIECLIP_CTOR,
+               (void*)hook_mcCtor, (void**)&orig_mcCtor);
+    InstallOne("NativeFont::ctor", RVA_NATIVEFONT_CTOR,
+               (void*)hook_fontCtor, (void**)&orig_fontCtor);
+    InstallOne("NativeFont::formatString", RVA_NATIVEFONT_FORMATSTRING,
+               (void*)hook_fmt, (void**)&orig_fmt);
+    InstallOne("LogicDataTables::ctor", RVA_LOGICDATATABLES_CTOR,
+               (void*)hook_ldtCtor, (void**)&orig_ldtCtor);
+    InstallOne("LogicDataTables::initDataTable", RVA_LOGICDATATABLES_INITDATATABLE,
+               (void*)hook_ldtInit, (void**)&orig_ldtInit);
+    InstallOne("LogicProjectileData::ctor", RVA_LOGICPROJECTILEDATA_CTOR,
+               (void*)hook_projCtor, (void**)&orig_projCtor);
+    InstallOne("LogicProjectileData::getIntValue", RVA_LOGICPROJECTILEDATA_GETINTVALUE,
+               (void*)hook_projGetInt, (void**)&orig_projGetInt);
+
+    NRLog("=== InstallHooks done ok=%d fail=%d ===", g_hooks_ok, g_hooks_fail);
+    fflush(g_log);
+}
+
+#pragma mark - UI
 
 @interface NRMenuVC : UIViewController
 @property (nonatomic, strong) UIStackView *stack;
@@ -254,30 +323,38 @@ static BOOL DetectGame(void) {
     [self.scroll addSubview:self.stack];
 
     NSArray *lines = @[
-        @"NullRythm Diag",
-        [NSString stringWithFormat:@"image: %s", g_image],
-        [NSString stringWithFormat:@"base: 0x%lx", g_base],
-        [NSString stringWithFormat:@"hooker: %p", dlsym(RTLD_DEFAULT, "MSHookFunction")],
-        [NSString stringWithFormat:@"mex: %p", MSHookMessageEx_p],
-        [NSString stringWithFormat:@"sendAction count: %d", g_sendActionCount],
+        @"NullRythm",
+        [NSString stringWithFormat:@"hooker: %s", g_hooker_path],
+        [NSString stringWithFormat:@"MSHookFunction: %p", MSHookFunction_p],
+        [NSString stringWithFormat:@"MSHookMessageEx: %p", MSHookMessageEx_p],
+        [NSString stringWithFormat:@"hooks ok: %d / fail: %d", g_hooks_ok, g_hooks_fail],
+        [NSString stringWithFormat:@"orig_recv: %p", orig_recv],
+        [NSString stringWithFormat:@"orig_gb: %p", orig_gbCtor],
+        [NSString stringWithFormat:@"orig_char: %p", orig_charCtor],
+        [NSString stringWithFormat:@"recv count: %d", g_recv_count],
+        [NSString stringWithFormat:@"gb count: %d", g_gb_count],
+        [NSString stringWithFormat:@"char count: %d", g_char_count],
         @"",
-        @"Full log: Documents/NullRythm.log",
+        @"Log: Documents/NullRythm.log",
     ];
     for (NSString *line in lines) {
         UILabel *l = [UILabel new];
         l.text = line;
-        l.textColor = [line isEqualToString:@"NullRythm Diag"]
-            ? [UIColor systemYellowColor] : [UIColor whiteColor];
-        l.font = [line isEqualToString:@"NullRythm Diag"]
-            ? [UIFont boldSystemFontOfSize:16]
-            : [UIFont monospacedSystemFontOfSize:10 weight:UIFontWeightRegular];
+        BOOL isTitle = [line isEqualToString:@"NullRythm"];
+        l.textColor = isTitle ? [UIColor systemYellowColor] : [UIColor whiteColor];
+        l.font = isTitle ? [UIFont boldSystemFontOfSize:16]
+                         : [UIFont monospacedSystemFontOfSize:10 weight:UIFontWeightRegular];
         l.numberOfLines = 0;
         [self.stack addArrangedSubview:l];
     }
 
-    __weak UILabel *counterLabel = self.stack.arrangedSubviews[5];
     [NSTimer scheduledTimerWithTimeInterval:0.5 repeats:YES block:^(NSTimer *t){
-        counterLabel.text = [NSString stringWithFormat:@"sendAction count: %d", g_sendActionCount];
+        UILabel *recvLbl = self.stack.arrangedSubviews[8];
+        UILabel *gbLbl   = self.stack.arrangedSubviews[9];
+        UILabel *chLbl   = self.stack.arrangedSubviews[10];
+        recvLbl.text = [NSString stringWithFormat:@"recv count: %d", g_recv_count];
+        gbLbl.text   = [NSString stringWithFormat:@"gb count: %d", g_gb_count];
+        chLbl.text   = [NSString stringWithFormat:@"char count: %d", g_char_count];
     }];
 
     dispatch_async(dispatch_get_main_queue(), ^{
@@ -313,30 +390,36 @@ static void ShowMenu(void) {
         g_win.windowLevel = UIWindowLevelAlert + 100;
         g_win.backgroundColor = [UIColor clearColor];
         g_win.rootViewController = [NRMenuVC new];
-        g_win.frame = CGRectMake(50, 100, 320, 400);
+        g_win.frame = CGRectMake(50, 100, 320, 420);
         g_win.hidden = NO;
         UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:g_win action:@selector(nr_drag:)];
         [g_win addGestureRecognizer:pan];
     });
 }
 
+#pragma mark - Init
+
+static void TryInstall(void);
+
+static void ScheduleRetry(void) {
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{ TryInstall(); });
+}
+
+static void TryInstall(void) {
+    if (!DetectGame()) {
+        NRLog("retry...");
+        ScheduleRetry();
+        return;
+    }
+    InstallHooks();
+    ShowMenu();
+    NRLog("=== done ===");
+}
+
 __attribute__((constructor))
 static void nr_init(void) {
-    NRLog("=== NullRythm diag init ===");
+    NRLog("=== NullRythm init ===");
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{
-        DumpEnvironment();
-        DumpDyldImages();
-        DumpHooker();
-        if (!DetectGame()) {
-            NRLog("game not found");
-            return;
-        }
-        NRLog(">>> game: %s base=%p", g_image, (void*)g_base);
-        DumpRvaProbe();
-        DumpObjcClasses();
-        TestObjcHook();
-        ShowMenu();
-        NRLog("=== diag done ===");
-    });
+                   dispatch_get_main_queue(), ^{ TryInstall(); });
 }
