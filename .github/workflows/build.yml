@@ -7,6 +7,9 @@ on:
     branches: [ main ]
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: macos-14
@@ -15,6 +18,9 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Bootstrap project files
         shell: bash
@@ -72,9 +78,8 @@ jobs:
 
           TWEAK_NAME = TaleMod
           TaleMod_FILES = src/Tweak.mm
-          TaleMod_CFLAGS = -fobjc-arc -Iinclude -Wno-unused-function -Wno-unused-variable
+          TaleMod_CFLAGS = -fobjc-arc -Iinclude -Wno-unused-function -Wno-unused-variable -Wl,-undefined,dynamic_lookup
           TaleMod_FRAMEWORKS = Foundation UIKit
-          TaleMod_LIBRARIES = substrate
 
           include $(THEOS_MAKE_PATH)/tweak.mk
           MAKE_EOF
@@ -274,6 +279,21 @@ jobs:
           echo "[+] bootstrap done"
           ls -la
           ls -la src include
+
+      - name: Commit bootstrapped files
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "[=] nothing to commit"
+          else
+            git commit -m "chore: bootstrap project files [skip ci]"
+            git push
+            echo "[+] committed"
+          fi
 
       - name: Install Theos
         shell: bash
