@@ -1,0 +1,49 @@
+name: Build Null
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-14
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Theos
+        run: |
+          set -euo pipefail
+          brew install ldid make || true
+          git clone --recursive --depth 1 https://github.com/theos/theos.git "$HOME/theos"
+          echo "THEOS=$HOME/theos" >> "$GITHUB_ENV"
+          echo "$HOME/theos/bin" >> "$GITHUB_PATH"
+          echo "/opt/homebrew/opt/make/libexec/gnubin" >> "$GITHUB_PATH"
+
+      - name: Build
+        run: |
+          set -euo pipefail
+          export PATH="/opt/homebrew/opt/make/libexec/gnubin:$PATH"
+          gmake -j"$(sysctl -n hw.ncpu)" ARCHS=arm64 CC=clang CXX=clang++
+
+      - name: Package
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          find .theos/obj -name '*.dylib' -exec cp {} out/Null.dylib \;
+          file out/Null.dylib
+          ls -la out/
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Null
+          path: out/Null.dylib
+          if-no-files-found: error
