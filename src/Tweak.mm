@@ -1,4 +1,3 @@
-// Tweak.mm
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
@@ -13,21 +12,16 @@
 #import <sys/time.h>
 #import "offsets.h"
 
-// ========== Типы хуков ==========
 typedef kern_return_t (*MSHookFunction_t)(void *sym, void *hook, void **old);
 typedef kern_return_t (*litehook_hook_function_t)(void *source, void *target);
-typedef void (*litehook_rebind_symbol_t)(const struct mach_header_64 *hdr, void *replacee, void *replacement, bool (*filter)(const struct mach_header_64 *));
 typedef int (*DobbyHook_t)(void *address, void *replace, void **result);
 
 static MSHookFunction_t p_MSHookFunction = NULL;
 static litehook_hook_function_t p_litehook_hook = NULL;
-static litehook_rebind_symbol_t p_litehook_rebind = NULL;
 static DobbyHook_t p_DobbyHook = NULL;
 
-// ========== Логирование ==========
 static FILE *g_log = NULL;
 static NSLock *g_lock = nil;
-static char g_logPath[1024] = {0};
 
 static NSString *LogPath(void) {
     NSString *docs = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents"];
@@ -50,7 +44,6 @@ static void TLog(NSString *msg) {
 
 #define LOG(fmt, ...) TLog([NSString stringWithFormat:fmt, ##__VA_ARGS__])
 
-// ========== Определение игры ==========
 static uintptr_t g_base = 0;
 
 static BOOL DetectGame(void) {
@@ -74,10 +67,8 @@ static BOOL DetectGame(void) {
     return NO;
 }
 
-// ========== Хук-функции ==========
 static int g_hook_count = 0;
 
-// Для MSHookFunction / DobbyHook (сохраняем оригинал)
 static void *g_orig_recv_ms = NULL;
 static void hook_recv_ms(void *self, void *msg, void *a, void *b, void *c, void *d) {
     g_hook_count++;
@@ -85,38 +76,29 @@ static void hook_recv_ms(void *self, void *msg, void *a, void *b, void *c, void 
     if (g_orig_recv_ms) ((void(*)(void*,void*,void*,void*,void*,void*))g_orig_recv_ms)(self, msg, a, b, c, d);
 }
 
-// Для litehook_hook_function (без оригинала)
 static void hook_recv_lite(void *self, void *msg, void *a, void *b, void *c, void *d) {
     g_hook_count++;
     if (g_hook_count < 5) LOG(@"litehook hook called #%d", g_hook_count);
 }
 
-// ========== Загрузка хуков ==========
 static void LoadHookers(void) {
     LOG(@"=== loading hookers ===");
 
-    // 1. MSHookFunction (ElleKit / CydiaSubstrate)
     p_MSHookFunction = (MSHookFunction_t)dlsym(RTLD_DEFAULT, "MSHookFunction");
     if (p_MSHookFunction) {
         Dl_info info = {0};
         if (dladdr((void *)p_MSHookFunction, &info) && info.dli_fname) {
             LOG(@"MSHookFunction from: %s", info.dli_fname);
         } else {
-            LOG(@"MSHookFunction = %p (no dladdr info)", p_MSHookFunction);
+            LOG(@"MSHookFunction = %p", p_MSHookFunction);
         }
     } else {
         LOG(@"MSHookFunction not found");
     }
 
-    // 2. litehook_hook_function
     p_litehook_hook = (litehook_hook_function_t)dlsym(RTLD_DEFAULT, "litehook_hook_function");
     LOG(@"litehook_hook_function = %p", p_litehook_hook);
 
-    // 3. litehook_rebind_symbol
-    p_litehook_rebind = (litehook_rebind_symbol_t)dlsym(RTLD_DEFAULT, "litehook_rebind_symbol");
-    LOG(@"litehook_rebind_symbol = %p", p_litehook_rebind);
-
-    // 4. DobbyHook (если загружен)
     p_DobbyHook = (DobbyHook_t)dlsym(RTLD_DEFAULT, "DobbyHook");
     if (!p_DobbyHook) {
         void *h = dlopen("@rpath/Dobby.framework/Dobby", RTLD_NOW | RTLD_GLOBAL);
@@ -126,7 +108,6 @@ static void LoadHookers(void) {
     LOG(@"DobbyHook = %p", p_DobbyHook);
 }
 
-// ========== Тестирование ==========
 static void TestMSHookFunction(void) {
     if (!p_MSHookFunction) { LOG(@"[MSHookFunction] skip: not available"); return; }
     if (!DetectGame()) { LOG(@"[MSHookFunction] skip: game not found"); return; }
@@ -139,9 +120,9 @@ static void TestMSHookFunction(void) {
     kern_return_t kr = p_MSHookFunction(addr, (void *)hook_recv_ms, &g_orig_recv_ms);
     LOG(@"[MSHookFunction] kr=%d orig=%p", kr, g_orig_recv_ms);
     if (g_orig_recv_ms) {
-        LOG(@"[MSHookFunction] ✅ SUCCESS: original pointer available");
+        LOG(@"[MSHookFunction] SUCCESS");
     } else {
-        LOG(@"[MSHookFunction] ❌ FAIL: original is NULL (JIT-Less limitation)");
+        LOG(@"[MSHookFunction] FAIL: original is NULL");
     }
 }
 
@@ -154,27 +135,12 @@ static void TestLitehookHook(void) {
     fflush(g_log);
 
     kern_return_t kr = p_litehook_hook(addr, (void *)hook_recv_lite);
-    LOG(@"[litehook_hook] kr=%d (no original call possible)", kr);
+    LOG(@"[litehook_hook] kr=%d", kr);
     if (kr == 0) {
-        LOG(@"[litehook_hook] ✅ HOOK INSTALLED (but original NOT callable)");
+        LOG(@"[litehook_hook] HOOK INSTALLED (no original call)");
     } else {
-        LOG(@"[litehook_hook] ❌ FAILED to install hook");
+        LOG(@"[litehook_hook] FAILED");
     }
-}
-
-static void TestLitehookRebind(void) {
-    if (!p_litehook_rebind) { LOG(@"[litehook_rebind] skip: not available"); return; }
-    if (!DetectGame()) { LOG(@"[litehook_rebind] skip: game not found"); return; }
-
-    LOG(@"[litehook_rebind] attempting to rebind receiveMessage symbol");
-    fflush(g_log);
-
-    void *orig = NULL;
-    p_litehook_rebind((const struct mach_header_64 *)g_base,
-                      "MessageManager::receiveMessage",
-                      (void *)hook_recv_ms,
-                      NULL);
-    LOG(@"[litehook_rebind] rebind called (check orig above if supported)");
 }
 
 static void TestDobby(void) {
@@ -185,17 +151,16 @@ static void TestDobby(void) {
     LOG(@"[Dobby] hooking at %p", addr);
     fflush(g_log);
 
-    g_orig_recv_ms = NULL;
-    int r = p_DobbyHook(addr, (void *)hook_recv_ms, &g_orig_recv_ms);
-    LOG(@"[Dobby] result=%d orig=%p", r, g_orig_recv_ms);
-    if (g_orig_recv_ms) {
-        LOG(@"[Dobby] ✅ SUCCESS: original pointer available");
+    void *orig = NULL;
+    int r = p_DobbyHook(addr, (void *)hook_recv_ms, &orig);
+    LOG(@"[Dobby] result=%d orig=%p", r, orig);
+    if (orig) {
+        LOG(@"[Dobby] SUCCESS");
     } else {
-        LOG(@"[Dobby] ❌ FAIL: original is NULL");
+        LOG(@"[Dobby] FAIL: original is NULL");
     }
 }
 
-// ========== UI ==========
 @interface NRVC : UIViewController
 @property (nonatomic, strong) UILabel *info;
 @end
@@ -219,7 +184,7 @@ static void TestDobby(void) {
     self.info.textColor = [UIColor whiteColor];
     self.info.font = [UIFont monospacedSystemFontOfSize:9 weight:UIFontWeightRegular];
     self.info.numberOfLines = 0;
-    self.info.frame = CGRectMake(16, 44, 280, 200);
+    self.info.frame = CGRectMake(16, 44, 280, 220);
     [self.view addSubview:self.info];
 
     [self refresh];
@@ -229,25 +194,15 @@ static void TestDobby(void) {
 }
 
 - (void)refresh {
-    NSString *ms = p_MSHookFunction ? (g_orig_recv_ms ? @"✅" : @"⚠️") : @"❌";
-    NSString *lh = p_litehook_hook ? @"✅" : @"❌";
-    NSString *lr = p_litehook_rebind ? @"✅" : @"❌";
-    NSString *db = p_DobbyHook ? (g_orig_recv_ms ? @"✅" : @"⚠️") : @"❌";
-
     self.info.text = [NSString stringWithFormat:
-        @"MSHookFunction: %@ (%p)\n"
-        @"litehook_hook: %@ (%p)\n"
-        @"litehook_rebind: %@ (%p)\n"
-        @"DobbyHook: %@ (%p)\n\n"
+        @"MSHookFunction: %p\n"
+        @"litehook_hook: %p\n"
+        @"DobbyHook: %p\n\n"
         @"orig_recv: %p\n"
-        @"hook calls: %d\n\n"
-        @"✅ = работает с оригиналом\n"
-        @"⚠️ = хук встал, но orig=NULL\n"
-        @"❌ = недоступен",
-        ms, p_MSHookFunction,
-        lh, p_litehook_hook,
-        lr, p_litehook_rebind,
-        db, p_DobbyHook,
+        @"hook calls: %d",
+        p_MSHookFunction,
+        p_litehook_hook,
+        p_DobbyHook,
         g_orig_recv_ms,
         g_hook_count];
 }
@@ -278,14 +233,13 @@ static void ShowUI(void) {
         g_win.windowLevel = UIWindowLevelAlert + 100;
         g_win.backgroundColor = [UIColor clearColor];
         g_win.rootViewController = [NRVC new];
-        g_win.frame = CGRectMake(60, 100, 312, 280);
+        g_win.frame = CGRectMake(60, 100, 312, 300);
         g_win.hidden = NO;
         UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:g_win action:@selector(nr_drag:)];
         [g_win addGestureRecognizer:pan];
     });
 }
 
-// ========== Init ==========
 __attribute__((constructor))
 static void init(void) {
     LOG(@"=== Hook Test init ===");
@@ -294,7 +248,6 @@ static void init(void) {
         LoadHookers();
         TestMSHookFunction();
         TestLitehookHook();
-        TestLitehookRebind();
         TestDobby();
         ShowUI();
         LOG(@"=== Hook Test done ===");
